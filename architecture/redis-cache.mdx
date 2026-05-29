@@ -1,0 +1,159 @@
+---
+title: "Redis O(1) ID Cache: Fast Context-Key Lookups at Scale"
+sidebarTitle: "Redis Cache"
+description: "How the BaseMap abstraction and per-domain CacheService classes use Redis to turn MongoDB compound-key lookups into O(1) reads during high-frequency backtests."
+---
+
+During a backtest, `backtest-kit` can invoke `readXData()` thousands of times per second — once per candle, per signal, per active strategy instance. Each call must resolve a domain-specific context key (e.g. `symbol + strategyName + exchangeName`) to the live document in MongoDB. A raw MongoDB B-tree scan is O(log n) and carries network round-trip latency; at scale this becomes the dominant bottleneck. The Redis cache layer reduces every repeated lookup to a single O(1) `GET` against an in-memory store, while MongoDB remains the authoritative source of truth.
+
+## The `BaseMap` Abstraction
+
+All 15 cache services inherit from `BaseMap`, a thin `ioredis` wrapper defined in `src/lib/common/BaseMap.ts`. It is constructed via the `factory` helper from `di-factory` so the IoC container can wire it without decorators:
+
+```typescript
+// src/lib/common/BaseMap.ts (abridged)
+export const BaseMap = factory(
+  class BaseMap {
+    constructor(
+      readonly connectionKey: string,
+      readonly ttlExpireSeconds: number = DEFAULT_TTL_EXPIRE_SECONDS  // 5 * 60 by default
+    ) {}
+
+    _getItemKey(key: string): string {
+      return `${this.connectionKey}:${key}`;   // namespaces every key by service prefix
+    }
+
+    async set(key: string, value: unknown): Promise<void> { /* redis.set + optional expire */ }
+    async get(key: string | null): Promise<unknown | null> { /* redis.get */ }
+    async delete(key: string): Promise<void>               { /* redis.del */ }
+    async has(key: string): Promise<boolean>               { /* redis.exists */ }
+    async clear(): Promise<void>                           { /* SCAN + DEL batch */ }
+    async toArray(): Promise<[string, unknown][]>          { /* SCAN + MGET */ }
+    async *iterate(): AsyncIterableIterator<readonly [string, unknown]> { /* SCAN cursor */ }
+    async *keys(): AsyncIterableIterator<string>           { /* SCAN cursor */ }
+    async *values(): AsyncIterableIterator<unknown>        { /* SCAN + MGET */ }
+    async size(): Promise<number>                          { /* SCAN count */ }
+  }
+);
+```
+
+Every Redis key stored by a `BaseMap` subclass is automatically prefixed with `connectionKey + ":"`, preventing namespace collisions between domain services. For example, all signal cache entries live under `signal_cache:*` and all candle cache entries under `candle_cache:*`.
+
+### TTL Behaviour
+
+When `ttlExpireSeconds` is set to any positive number, `BaseMap.set` calls `redis.expire(itemKey, ttlExpireSeconds)` immediately after the `SET`. When it is set to **`-1`** the `expire` call is skipped entirely, making the entry permanent for the lifetime of Redis. All 15 cache services currently pass `-1`, meaning cache entries persist until Redis is restarted or explicitly cleared. This is the right default for backtest context keys because the domain data they point to is durable in MongoDB.
+
+## Per-Domain Cache Services
+
+Each domain gets its own cache class that encodes the compound key scheme for that domain. `SignalCacheService` is a representative example:
+
+```typescript
+// src/lib/services/cache/SignalCacheService.ts
+const REDIS_KEY = "signal_cache";
+
+export class SignalCacheService extends BaseMap(REDIS_KEY, -1) {
+
+  private _cacheKey(
+    symbol: string,
+    strategyName: string,
+    exchangeName: string,
+  ): string {
+    return `${exchangeName}:${strategyName}:${symbol}`;
+  }
+
+  public async hasSignalId(
+    symbol: string,
+    strategyName: string,
+    exchangeName: string,
+  ): Promise<boolean> {
+    return await this.has(this._cacheKey(symbol, strategyName, exchangeName));
+  }
+
+  public async getSignalId(
+    symbol: string,
+    strategyName: string,
+    exchangeName: string,
+  ): Promise<string | null> {
+    const id = <string>await super.get(
+      this._cacheKey(symbol, strategyName, exchangeName),
+    );
+    return id ?? null;
+  }
+
+  public async setSignalId(row: ISignalRowDoc): Promise<string> {
+    await super.set(
+      this._cacheKey(row.symbol, row.strategyName, row.exchangeName),
+      row.id,  // stores the MongoDB _id string
+    );
+    return row.id;
+  }
+}
+```
+
+The cache stores only the **MongoDB document `_id`** — a short string. The full document is then fetched with `findById(_id)`, which MongoDB resolves via its primary `_id` index in O(1) time. This two-step pattern (Redis `GET` → Mongo `findById`) is always faster than a multi-field compound index scan.
+
+## Complete Read Path
+
+`SignalDbService.findByContext` shows the canonical read path shared by all DB services:
+
+```typescript
+// src/lib/services/db/SignalDbService.ts
+public findByContext = async (
+  symbol: string,
+  strategyName: string,
+  exchangeName: string,
+): Promise<ISignalRowDoc | null> => {
+  // Step 1 — try Redis (O(1))
+  try {
+    const cachedId = await this.signalCacheService.getSignalId(
+      symbol, strategyName, exchangeName,
+    );
+    if (cachedId) {
+      // Step 2a — cache HIT: fetch by primary key (O(1))
+      return await super.findById(cachedId) as ISignalRowDoc;
+    }
+  } catch {
+    void 0;  // Redis error → fall through to Mongo
+  }
+
+  // Step 2b — cache MISS: full compound-index scan (O(log n))
+  const result = await super.findByFilter(
+    { symbol, strategyName, exchangeName },
+  ) as ISignalRowDoc | null;
+
+  // Step 3 — backfill Redis so next read is O(1)
+  if (result) {
+    await this.signalCacheService.setSignalId(result);
+  }
+  return result;
+};
+```
+
+| Scenario | Redis | MongoDB | Net cost |
+|---|---|---|---|
+| **Cache hit** | `GET` (O(1)) | `findById` on `_id` (O(1)) | Two in-memory round trips |
+| **Cache miss** | `GET` → null | `findOne` on compound index (O(log n)) + Redis `SET` | One B-tree scan, then O(1) forever after |
+| **After upsert** | `SET` (synchronous) | Already written | Cache always current |
+
+### Write Path Cache Update
+
+After every successful `findOneAndUpdate`, the DB service updates the cache entry inline — within the same logical operation — before returning to the caller:
+
+```typescript
+// SignalDbService.upsert (abridged)
+const document = await SignalModel.findOneAndUpdate(
+  filter,
+  { $set: { payload } },
+  { upsert: true, new: true, setDefaultsOnInsert: true },
+);
+const result = readTransform(document.toJSON()) as unknown as ISignalRowDoc;
+await this.signalCacheService.setSignalId(result);  // ← synchronous cache update
+```
+
+This guarantees that the read-after-write contract is satisfied even in processes that share the same Redis instance.
+
+<Note>
+**Cold-start and Redis restart recovery**
+
+If Redis is empty (fresh start, restart, or `FLUSHALL`), every first read will be a cache miss. The DB service transparently falls back to MongoDB, retrieves the document via the compound index, and backfills the Redis entry. No manual cache warming step is needed — the cache rebuilds itself organically as each context key is accessed. The `try/catch` block around the Redis read in `findByContext` also protects against transient Redis connectivity errors, allowing the system to degrade gracefully to full MongoDB reads rather than failing outright.
+</Note>

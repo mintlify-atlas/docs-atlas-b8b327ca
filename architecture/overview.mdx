@@ -1,0 +1,137 @@
+---
+title: "Persistence Architecture: MongoDB + Redis Two-Layer Design"
+sidebarTitle: "Overview"
+description: "How backtest-kit-redis-mongo-docker organizes MongoDB as source of truth and Redis as an O(1) cache layer across 15 domain-specific persist adapters."
+---
+
+`backtest-kit-redis-mongo-docker` implements a two-layer persistence architecture: **MongoDB** serves as the durable source of truth for all trading data, while **Redis** acts as a high-speed O(1) identity cache that accelerates repeated context-key lookups during backtests and live runs. Every read path checks Redis first; only on a cache miss does the adapter fall back to MongoDB, after which it immediately backfills the cache so subsequent reads stay fast.
+
+## Layered Data Flow
+
+A call from the backtest-kit core traverses three layers before returning:
+
+```
+backtest-kit core
+       │
+       ▼
+ IPersist* adapter          (src/config/setup.ts)
+       │
+       ├─── Redis cache check  ──► cache HIT  ──► MongoDB findById(_id)  ──► return
+       │                                                                         │
+       └─── cache MISS ──► MongoDB findOne (indexed filter) ──► Redis SET ──► return
+```
+
+On a **write** the path is equally direct:
+
+```
+writeXData(payload, when?)
+       │
+       ▼
+ XDbService.upsert()  ──►  MongoDB findOneAndUpdate (atomic upsert)
+                                     │
+                                     └──► XCacheService.setXId(result)  ──► Redis SET
+```
+
+After the upsert returns, the cache entry is updated in the same synchronous critical section, so `readXData` called immediately afterward always sees the freshly written value.
+
+## IoC Container
+
+All services are wired together in `src/lib/index.ts` via a lightweight IoC container built on `di-factory`. The container is partitioned into three groups:
+
+| Group | Count | Purpose |
+|---|---|---|
+| **Base services** | 3 | Infrastructure: logger, Mongo connection, Redis connection |
+| **Cache services** | 15 | Per-domain Redis wrappers (one per domain) |
+| **DB services** | 15 | Per-domain MongoDB CRUD + upsert logic |
+
+The registration happens in `src/lib/core/provide.ts` using `provide(TOKEN, factory)` calls, and `src/lib/index.ts` exposes the resolved instances via the `ioc` object:
+
+```typescript
+// src/lib/index.ts (abridged)
+const baseServices = {
+  loggerService:  inject<LoggerService>(TYPES.loggerService),
+  mongoService:   inject<MongooseService>(TYPES.mongoService),
+  redisService:   inject<RedisService>(TYPES.redisService),
+};
+
+const cacheServices = {
+  candleCacheService:        inject<CandleCacheService>(TYPES.candleCacheService),
+  signalCacheService:        inject<SignalCacheService>(TYPES.signalCacheService),
+  scheduleCacheService:      inject<ScheduleCacheService>(TYPES.scheduleCacheService),
+  riskCacheService:          inject<RiskCacheService>(TYPES.riskCacheService),
+  partialCacheService:       inject<PartialCacheService>(TYPES.partialCacheService),
+  breakevenCacheService:     inject<BreakevenCacheService>(TYPES.breakevenCacheService),
+  storageCacheService:       inject<StorageCacheService>(TYPES.storageCacheService),
+  notificationCacheService:  inject<NotificationCacheService>(TYPES.notificationCacheService),
+  logCacheService:           inject<LogCacheService>(TYPES.logCacheService),
+  measureCacheService:       inject<MeasureCacheService>(TYPES.measureCacheService),
+  intervalCacheService:      inject<IntervalCacheService>(TYPES.intervalCacheService),
+  memoryCacheService:        inject<MemoryCacheService>(TYPES.memoryCacheService),
+  recentCacheService:        inject<RecentCacheService>(TYPES.recentCacheService),
+  stateCacheService:         inject<StateCacheService>(TYPES.stateCacheService),
+  sessionCacheService:       inject<SessionCacheService>(TYPES.sessionCacheService),
+};
+
+const dbServices = {
+  candleDbService:        inject<CandleDbService>(TYPES.candleDbService),
+  signalDbService:        inject<SignalDbService>(TYPES.signalDbService),
+  scheduleDbService:      inject<ScheduleDbService>(TYPES.scheduleDbService),
+  riskDbService:          inject<RiskDbService>(TYPES.riskDbService),
+  partialDbService:       inject<PartialDbService>(TYPES.partialDbService),
+  breakevenDbService:     inject<BreakevenDbService>(TYPES.breakevenDbService),
+  storageDbService:       inject<StorageDbService>(TYPES.storageDbService),
+  notificationDbService:  inject<NotificationDbService>(TYPES.notificationDbService),
+  logDbService:           inject<LogDbService>(TYPES.logDbService),
+  measureDbService:       inject<MeasureDbService>(TYPES.measureDbService),
+  intervalDbService:      inject<IntervalDbService>(TYPES.intervalDbService),
+  memoryDbService:        inject<MemoryDbService>(TYPES.memoryDbService),
+  recentDbService:        inject<RecentDbService>(TYPES.recentDbService),
+  stateDbService:         inject<StateDbService>(TYPES.stateDbService),
+  sessionDbService:       inject<SessionDbService>(TYPES.sessionDbService),
+};
+
+export const ioc = {
+  ...baseServices,
+  ...cacheServices,
+  ...dbServices,
+};
+
+// Also published to globalThis for convenience:
+Object.assign(globalThis, { ioc });
+```
+
+All 15 adapter registrations in `src/config/setup.ts` use `ioc.xDbService` and `ioc.xCacheService` directly; no adapter needs to know whether it is talking to Mongo or Redis.
+
+## Infrastructure Guard
+
+Before any adapter method does real work on its first call, it awaits `waitForInfra()` — a `singleshot` promise that resolves only after both `mongoService.waitForInit()` and `redisService.waitForInit()` complete. Subsequent calls skip the guard at zero cost.
+
+```typescript
+const waitForInfra = singleshot(async () => {
+  await Promise.all([
+    ioc.mongoService.waitForInit(),
+    ioc.redisService.waitForInit(),
+  ]);
+});
+```
+
+## Further Reading
+
+<CardGroup cols={2}>
+  <Card title="Atomicity" icon="shield-check" href="/architecture/atomicity">
+    How `findOneAndUpdate` with compound unique indexes eliminates E11000 race
+    conditions and guarantees read-after-write consistency.
+  </Card>
+  <Card title="Redis Cache" icon="bolt" href="/architecture/redis-cache">
+    The `BaseMap` abstraction and per-domain `CacheService` classes that turn
+    compound-key lookups into O(1) Redis reads.
+  </Card>
+  <Card title="Look-Ahead Bias" icon="clock" href="/architecture/look-ahead-bias">
+    How the indexed `when: Date` column lets backtest-kit's bias filter verify
+    that reads never see future data.
+  </Card>
+  <Card title="Deployment" icon="rocket" href="/deployment">
+    Docker Compose setup for running MongoDB, Redis, and the adapter layer
+    together in a single-command environment.
+  </Card>
+</CardGroup>

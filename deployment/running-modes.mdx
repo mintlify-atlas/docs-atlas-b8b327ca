@@ -1,0 +1,274 @@
+---
+title: "Backtest, Paper, and Live Running Modes Explained"
+sidebarTitle: "Running Modes"
+description: "How to select between backtest, paper, and live modes in backtest-kit-redis-mongo-docker using CLI flags or container environment variables."
+---
+
+The backtest-kit Redis+MongoDB Docker project supports three distinct execution modes that map directly to the three core operating states of the `backtest-kit` framework. **Backtest** mode replays historical OHLCV data through your strategy and writes results to MongoDB for analysis. **Paper** mode connects to a live exchange feed and simulates trade execution without placing real orders, letting you validate strategy behaviour in real market conditions. **Live** mode connects to a real exchange and submits actual orders. All three modes share the same MongoDB+Redis persistence layer and the same strategy code — only the execution engine and data source differ.
+
+Mode selection works the same way whether you run locally or inside Docker. Locally, you pass CLI flags (`--backtest`, `--paper`, `--live`) together with `--entry` to the Node process. Inside Docker, you set the `MODE` environment variable to `backtest`, `paper`, or `live` together with `ENTRY=1`. Both paths are routed through the same `getArgs()` helper.
+
+## How `getArgs()` works
+
+`src/helpers/getArgs.ts` uses Node's built-in `util.parseArgs` to parse the process arguments at startup. It is wrapped with `singleshot` from `functools-kit` so the parsed result is computed once and memoised for the lifetime of the process.
+
+```typescript
+// src/helpers/getArgs.ts
+import { singleshot } from "functools-kit";
+import { parseArgs } from "util";
+
+export const getArgs = singleshot(() => {
+  const { values } = parseArgs({
+    args: process.argv,
+    options: {
+      entry: {
+        type: "boolean",
+        default: false,
+      },
+      backtest: {
+        type: "boolean",
+        default: false,
+      },
+      live: {
+        type: "boolean",
+        default: false,
+      },
+      paper: {
+        type: "boolean",
+        default: false,
+      },
+    },
+    strict: false,
+    allowPositionals: true,
+  });
+  return { values };
+});
+```
+
+The four recognised flags are:
+
+- **`--entry`** — Must always be present for any mode to run. Without it, every mode entry point returns immediately. This acts as an intentional safety gate — the process starts cleanly but executes no strategy logic.
+- **`--backtest`** — Activates backtest mode.
+- **`--paper`** — Activates paper trading mode.
+- **`--live`** — Activates live trading mode.
+
+`strict: false` and `allowPositionals: true` mean extra flags (such as the strategy file path) are accepted without errors.
+
+<Tabs>
+  <Tab title="Backtest">
+    Backtest mode replays historical OHLCV candle data through your strategy. The full date range of candles is fetched from the exchange and stored in MongoDB before the strategy begins, preventing redundant exchange API calls and ensuring the simulation runs at maximum speed. Results — signals, positions, risk snapshots, and logs — are written to all 15 MongoDB collections via the standard persist adapters.
+
+    **Entry point: `src/main/backtest.ts`**
+
+    ```typescript
+    // src/main/backtest.ts
+    import { getArgs } from "../helpers/getArgs";
+    import ioc from "../lib";
+    import { Backtest, warmCandles, waitForReady } from "backtest-kit";
+    import { ExchangeName } from "../enum/ExchangeName";
+    import { FrameName } from "../enum/FrameName";
+    import { StrategyName } from "../enum/StrategyName";
+
+    const main = async () => {
+      const { values } = getArgs();
+
+      if (!values.entry) {
+        return;
+      }
+
+      if (!values.backtest) {
+        return;
+      }
+
+      {
+        await ioc.mongoService.waitForInit();
+        await ioc.redisService.waitForInit();
+      }
+
+      await waitForReady(true);
+
+      await warmCandles({
+        exchangeName: ExchangeName.CCXT,
+        from: new Date("2026-01-01T00:00:00Z"),
+        to: new Date("2026-01-31T23:59:59Z"),
+        interval: "1m",
+        symbol: "TRXUSDT",
+      });
+
+      Backtest.background("TRXUSDT", {
+        exchangeName: ExchangeName.CCXT,
+        frameName: FrameName.Jan2026Frame,
+        strategyName: StrategyName.Jan2026Strategy,
+      });
+    };
+
+    main();
+    ```
+
+    **Startup sequence:**
+
+    1. `values.entry && values.backtest` — both guards must pass or the function returns immediately.
+    2. `mongoService.waitForInit()` and `redisService.waitForInit()` — await successful connections to both infrastructure services before proceeding.
+    3. `waitForReady(true)` — passes `true` to signal backtest mode, initialising all 15 persist adapters in their backtest configuration.
+    4. `warmCandles(...)` — fetches all 1-minute OHLCV candles for the configured symbol and date range from the exchange and stores them in the `candle-items` MongoDB collection. Subsequent adapter reads during the simulation are served from this local cache.
+    5. `Backtest.background(symbol, context)` — starts the backtest engine asynchronously, replaying candles through the strategy.
+
+    **CLI:**
+
+    ```bash
+    npm run start -- --entry --backtest --ui ./build/index.cjs
+    ```
+
+    **Docker environment variables:**
+
+    ```bash
+    MODE=backtest
+    ENTRY=1
+    UI=1
+    ```
+  </Tab>
+  <Tab title="Paper">
+    Paper trading mode connects to a live exchange data feed and runs your strategy in real time, but does not submit any real orders to the exchange. All signals and position tracking are written to MongoDB exactly as in live mode, making it the ideal way to validate strategy logic and risk parameters against current market conditions before committing real capital.
+
+    **Entry point: `src/main/paper.ts`**
+
+    ```typescript
+    // src/main/paper.ts
+    import { getArgs } from "../helpers/getArgs";
+    import ioc from "../lib";
+    import { Live, waitForReady } from "backtest-kit";
+    import { ExchangeName } from "../enum/ExchangeName";
+    import { StrategyName } from "../enum/StrategyName";
+
+    const main = async () => {
+      const { values } = getArgs();
+
+      if (!values.entry) {
+        return;
+      }
+
+      if (!values.paper) {
+        return;
+      }
+
+      {
+        await ioc.mongoService.waitForInit();
+        await ioc.redisService.waitForInit();
+      }
+
+      await waitForReady(false);
+
+      Live.background("TRXUSDT", {
+        exchangeName: ExchangeName.CCXT,
+        strategyName: StrategyName.Jan2026Strategy,
+      });
+    };
+
+    main();
+    ```
+
+    The entry point gates on `values.entry && values.paper`. `waitForReady(false)` is called with `false` to initialise the adapters in live/paper configuration (as opposed to the `true` used in backtest mode). `Live.background` from `backtest-kit` drives the strategy with a real-time market data feed while simulating order execution locally.
+
+    **CLI:**
+
+    ```bash
+    npm run start -- --entry --paper --ui ./build/index.cjs
+    ```
+
+    **Docker environment variables:**
+
+    ```bash
+    MODE=paper
+    ENTRY=1
+    ```
+  </Tab>
+  <Tab title="Live">
+    Live mode connects to the real exchange and submits actual buy and sell orders. The entry point and startup sequence are identical to paper mode, except that the guard condition checks `values.live` instead of `values.paper`, and `Live.background` is wired to execute real orders via the configured exchange adapter.
+
+    **Entry point: `src/main/live.ts`**
+
+    ```typescript
+    // src/main/live.ts
+    import { getArgs } from "../helpers/getArgs";
+    import ioc from "../lib";
+    import { Live, waitForReady } from "backtest-kit";
+    import { ExchangeName } from "../enum/ExchangeName";
+    import { StrategyName } from "../enum/StrategyName";
+
+    const main = async () => {
+      const { values } = getArgs();
+
+      if (!values.entry) {
+        return;
+      }
+
+      if (!values.live) {
+        return;
+      }
+
+      {
+        await ioc.mongoService.waitForInit();
+        await ioc.redisService.waitForInit();
+      }
+
+      await waitForReady(false);
+
+      Live.background("TRXUSDT", {
+        exchangeName: ExchangeName.CCXT,
+        strategyName: StrategyName.Jan2026Strategy,
+      });
+    };
+
+    main();
+    ```
+
+    The entry point gates on `values.entry && values.live`. As with paper mode, `waitForReady(false)` initialises adapters in live configuration. Real exchange credentials must be configured in your strategy's exchange adapter before using this mode.
+
+    **CLI:**
+
+    ```bash
+    npm run start -- --entry --live ./build/index.cjs
+    ```
+
+    **Docker environment variables:**
+
+    ```bash
+    MODE=live
+    ENTRY=1
+    ```
+
+    <Warning>
+      **Live mode places real orders on a real exchange.** Ensure your strategy has been thoroughly tested in backtest and paper modes first. Verify exchange API credentials, position sizing, and risk parameters before enabling live mode. There is no undo for executed trades.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## `warmCandles`: prefetching OHLCV data for backtests
+
+Before the backtest simulation begins, `backtest-kit`'s `warmCandles` function is called to fetch the entire OHLCV candle history for the configured date range and store it in the `candle-items` MongoDB collection. This pre-population step is unique to backtest mode — paper and live modes consume candles from the exchange's real-time stream instead.
+
+```typescript
+await warmCandles({
+  exchangeName: ExchangeName.CCXT,
+  from: new Date("2026-01-01T00:00:00Z"),
+  to: new Date("2026-01-31T23:59:59Z"),
+  interval: "1m",
+  symbol: "TRXUSDT",
+});
+```
+
+**Parameters:**
+
+| Field | Description |
+|---|---|
+| `exchangeName` | The exchange adapter to fetch candles from (e.g. `ExchangeName.CCXT`). |
+| `from` | Start of the historical date range (inclusive). |
+| `to` | End of the historical date range (inclusive). |
+| `interval` | Candle interval string, e.g. `"1m"`, `"5m"`, `"1h"`. |
+| `symbol` | Trading pair symbol to fetch, e.g. `"TRXUSDT"`. |
+
+Once `warmCandles` completes, every subsequent candle read during the simulation is served from the local MongoDB `candle-items` collection via the `CandleDbService` / `CandleCacheService` stack (O(1) Redis lookup → O(1) Mongo by `_id`). This eliminates redundant exchange API calls during the backtest replay loop and significantly reduces simulation time for large date ranges.
+
+<Note>
+  The web UI is available on port **60050** in all three modes. Pass the `--ui` flag when running locally, or set `UI=1` when running inside Docker. The UI provides a real-time dashboard showing signals, open positions, equity curves, and strategy logs — useful for monitoring paper and live runs as well as inspecting backtest results after the simulation completes.
+</Note>

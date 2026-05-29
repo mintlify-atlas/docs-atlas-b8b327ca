@@ -1,0 +1,403 @@
+---
+title: "Measure, Interval, and Memory Persist Adapters (Soft-Delete)"
+sidebarTitle: "Measure / Interval / Memory"
+description: "Reference for the three soft-delete persist adapters: Measure for LLM response caching, Interval for once-per-interval markers, and Memory for per-signal key-value storage."
+---
+
+Measure, Interval, and Memory are the three **soft-delete adapters**. Instead of physically removing documents, all three set `removed: true` on the record (and `payload.removed: true` inside the payload itself) to mark it as deleted. Listing operations filter on `removed: false` to skip tombstones. This matches the behavior of the default file-based persist implementation bundled with backtest-kit and makes it safe to replay or audit the full history of creates and deletes.
+
+## Soft-delete mechanics
+
+When `softRemove` is called, a `findOneAndUpdate` with `$set: { removed: true, "payload.removed": true }` is issued — no document is physically deleted:
+
+```typescript
+// Example from IntervalDbService
+public softRemove = async (bucket: string, entryKey: string): Promise<void> => {
+  const filter = { bucket, entryKey };
+  const document = await IntervalModel.findOneAndUpdate(
+    filter,
+    { $set: { removed: true, "payload.removed": true } },
+    { new: true },
+  );
+  if (!document) return;
+  const result = readTransform(document.toJSON()) as unknown as IIntervalRow;
+  await this.intervalCacheService.setIntervalId(result);
+};
+```
+
+The Redis cache entry is updated with the soft-deleted document so that subsequent reads via `findByKey` correctly see `removed: true` without hitting MongoDB.
+
+`listKeys` / `listEntries` always passes `{ removed: false }` as an additional filter to `findAll`, ensuring tombstones are invisible to the engine:
+
+```typescript
+public listKeys = async (bucket: string): Promise<string[]> => {
+  const rows = await super.findAll({ bucket, removed: false }) as IIntervalRow[];
+  return rows.map((row) => row.entryKey);
+};
+```
+
+---
+
+## Measure adapter
+
+Caches LLM and external API responses. Because the data is fetched from an external service rather than derived from market data, it is intentionally **exempt from look-ahead bias checking**.
+
+**Context key:** `(bucket: string, entryKey: string)`  
+**Collection:** `measure-items`
+
+### `IPersistMeasureInstance` implementation
+
+```typescript
+PersistMeasureAdapter.usePersistMeasureAdapter(class implements IPersistMeasureInstance {
+  constructor(readonly bucket: string) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readMeasureData(key: string): Promise<MeasureData | null> {
+    const row = await ioc.measureDbService.findByKey(this.bucket, key);
+    if (!row || row.removed) return null;
+    return row.payload;
+  }
+
+  async writeMeasureData(data: MeasureData, key: string, _when: Date): Promise<void> {
+    await ioc.measureDbService.upsert(this.bucket, key, data);
+  }
+
+  async removeMeasureData(key: string): Promise<void> {
+    await ioc.measureDbService.softRemove(this.bucket, key);
+  }
+
+  async *listMeasureData(): AsyncGenerator<string> {
+    const keys = await ioc.measureDbService.listKeys(this.bucket);
+    for (const key of keys) {
+      yield key;
+    }
+  }
+});
+```
+
+Note that `_when` is accepted but ignored in `writeMeasureData` — the Measure schema has no `when` field.
+
+### Measure Mongoose schema
+
+From `src/schema/Measure.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { MeasureData } from "backtest-kit";
+
+interface IMeasureDto {
+  bucket: string;
+  entryKey: string;
+  payload: MeasureData;
+  removed: boolean;
+}
+
+interface MeasureDocument extends IMeasureDto, Document {}
+
+interface IMeasureRow extends IMeasureDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const MeasureSchema: Schema<MeasureDocument> = new Schema(
+  {
+    bucket:   { type: String, required: true, index: true },
+    entryKey: { type: String, required: true, index: true },
+    payload:  { type: Schema.Types.Mixed, required: true },
+    removed:  { type: Boolean, required: true, default: false, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+MeasureSchema.index({ bucket: 1, entryKey: 1 }, { unique: true });
+
+const MeasureModel = mongoose.model<MeasureDocument>("measure-items", MeasureSchema);
+```
+
+There is no `when` field. Measure data is treated as eternal cache — it has no temporal relationship with market data.
+
+### `MeasureDbService` — upsert and soft-remove
+
+```typescript
+public upsert = async (
+  bucket: string,
+  entryKey: string,
+  payload: MeasureData,
+): Promise<void> => {
+  const filter = { bucket, entryKey };
+  const document = await MeasureModel.findOneAndUpdate(
+    filter,
+    { $set: { payload, removed: payload.removed } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IMeasureRow;
+  await this.measureCacheService.setMeasureId(result);
+};
+
+public softRemove = async (bucket: string, entryKey: string): Promise<void> => {
+  const filter = { bucket, entryKey };
+  const document = await MeasureModel.findOneAndUpdate(
+    filter,
+    { $set: { removed: true, "payload.removed": true } },
+    { new: true },
+  );
+  if (!document) return;
+  const result = readTransform(document.toJSON()) as unknown as IMeasureRow;
+  await this.measureCacheService.setMeasureId(result);
+};
+
+public listKeys = async (bucket: string): Promise<string[]> => {
+  const rows = await super.findAll({ bucket, removed: false }) as IMeasureRow[];
+  return rows.map((row) => row.entryKey);
+};
+```
+
+<Note>
+`writeMeasureData` also propagates `payload.removed` from the incoming `MeasureData` object itself. This means a caller can pre-mark a payload as removed by setting `payload.removed = true` before calling write, though calling `removeMeasureData` explicitly is the conventional approach.
+</Note>
+
+---
+
+## Interval adapter
+
+Tracks whether a one-time task has been completed within the current backtest interval. Useful for "run only once per candle" guards. Has a `when: Date` column for look-ahead bias protection.
+
+**Context key:** `(bucket: string, entryKey: string)`  
+**Collection:** `interval-items`
+
+### `IPersistIntervalInstance` implementation
+
+```typescript
+PersistIntervalAdapter.usePersistIntervalAdapter(class implements IPersistIntervalInstance {
+  constructor(readonly bucket: string) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readIntervalData(key: string): Promise<IntervalData | null> {
+    const row = await ioc.intervalDbService.findByKey(this.bucket, key);
+    if (!row || row.removed) return null;
+    return row.payload;
+  }
+
+  async writeIntervalData(data: IntervalData, key: string, when: Date): Promise<void> {
+    await ioc.intervalDbService.upsert(this.bucket, key, data, when);
+  }
+
+  async removeIntervalData(key: string): Promise<void> {
+    await ioc.intervalDbService.softRemove(this.bucket, key);
+  }
+
+  async *listIntervalData(): AsyncGenerator<string> {
+    const keys = await ioc.intervalDbService.listKeys(this.bucket);
+    for (const key of keys) {
+      yield key;
+    }
+  }
+});
+```
+
+### Interval Mongoose schema
+
+From `src/schema/Interval.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { IntervalData } from "backtest-kit";
+
+interface IIntervalDto {
+  bucket: string;
+  entryKey: string;
+  payload: IntervalData;
+  removed: boolean;
+  when: number;
+}
+
+interface IntervalDocument extends IIntervalDto, Document {}
+
+interface IIntervalRow extends IIntervalDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const IntervalSchema: Schema<IntervalDocument> = new Schema(
+  {
+    bucket:   { type: String, required: true, index: true },
+    entryKey: { type: String, required: true, index: true },
+    payload:  { type: Schema.Types.Mixed, required: true },
+    removed:  { type: Boolean, required: true, default: false, index: true },
+    when:     { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+IntervalSchema.index({ bucket: 1, entryKey: 1 }, { unique: true });
+
+const IntervalModel = mongoose.model<IntervalDocument>("interval-items", IntervalSchema);
+```
+
+Compared to `MeasureSchema`, `IntervalSchema` adds the `when: Number` field for bias protection.
+
+### `IntervalDbService` — `clearBucket` for test cleanup
+
+`IntervalDbService` provides one extra method not present on Measure or Memory: `clearBucket`. It physically deletes all documents for a bucket and removes their Redis cache entries, which is useful for resetting interval guards between integration test runs:
+
+```typescript
+public clearBucket = async (bucket: string): Promise<void> => {
+  const rows = await super.findAll({ bucket }) as IIntervalRow[];
+  for (const row of rows) {
+    await this.intervalCacheService.deleteIntervalId(bucket, row.entryKey);
+  }
+  await IntervalModel.deleteMany({ bucket });
+};
+```
+
+---
+
+## Memory adapter
+
+Per-signal key-value store. Any data a strategy wants to associate with a specific signal for its lifetime can be stored here. Entries are namespaced by `(signalId, bucketName, memoryId)` and retrieved as `{ memoryId, data }` pairs via the async generator. Has a `when: Date` column.
+
+**Context key:** `(signalId: string, bucketName: string, memoryId: string)`  
+**Collection:** `memory-items`
+
+### `IPersistMemoryInstance` implementation
+
+```typescript
+PersistMemoryAdapter.usePersistMemoryAdapter(class implements IPersistMemoryInstance {
+  constructor(
+    readonly signalId: string,
+    readonly bucketName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readMemoryData(memoryId: string): Promise<MemoryData | null> {
+    const row = await ioc.memoryDbService.findByMemoryId(
+      this.signalId, this.bucketName, memoryId,
+    );
+    if (!row || row.removed) return null;
+    return row.payload;
+  }
+
+  async hasMemoryData(memoryId: string): Promise<boolean> {
+    return await ioc.memoryDbService.hasMemoryEntry(
+      this.signalId, this.bucketName, memoryId,
+    );
+  }
+
+  async writeMemoryData(data: MemoryData, memoryId: string, when: Date): Promise<void> {
+    await ioc.memoryDbService.upsert(
+      this.signalId, this.bucketName, memoryId, data, when,
+    );
+  }
+
+  async removeMemoryData(memoryId: string): Promise<void> {
+    await ioc.memoryDbService.softRemove(
+      this.signalId, this.bucketName, memoryId,
+    );
+  }
+
+  async *listMemoryData(): AsyncGenerator<{ memoryId: string; data: MemoryData }> {
+    const rows = await ioc.memoryDbService.listEntries(
+      this.signalId, this.bucketName,
+    );
+    for (const row of rows) {
+      yield { memoryId: row.memoryId, data: row.payload };
+    }
+  }
+
+  dispose(): void { void 0; }
+});
+```
+
+`listMemoryData` yields `{ memoryId, data }` objects — not just keys — unlike Measure and Interval which yield only the key strings.
+
+### Memory Mongoose schema
+
+From `src/schema/Memory.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { MemoryData } from "backtest-kit";
+
+interface IMemoryDto {
+  signalId: string;
+  bucketName: string;
+  memoryId: string;
+  payload: MemoryData;
+  removed: boolean;
+  when: number;
+}
+
+interface MemoryDocument extends IMemoryDto, Document {}
+
+interface IMemoryRow extends IMemoryDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const MemorySchema: Schema<MemoryDocument> = new Schema(
+  {
+    signalId:   { type: String, required: true, index: true },
+    bucketName: { type: String, required: true, index: true },
+    memoryId:   { type: String, required: true, index: true },
+    payload:    { type: Schema.Types.Mixed, required: true },
+    removed:    { type: Boolean, required: true, default: false, index: true },
+    when:       { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+MemorySchema.index(
+  { signalId: 1, bucketName: 1, memoryId: 1 },
+  { unique: true }
+);
+
+const MemoryModel = mongoose.model<MemoryDocument>("memory-items", MemorySchema);
+```
+
+### `MemoryDbService` — `hasMemoryEntry` and `listEntries`
+
+`hasMemoryEntry` is an existence check that tries Redis first, then falls back to MongoDB without returning the full payload:
+
+```typescript
+public hasMemoryEntry = async (
+  signalId: string,
+  bucketName: string,
+  memoryId: string,
+): Promise<boolean> => {
+  if (await this.memoryCacheService.hasMemoryEntryId(signalId, bucketName, memoryId)) {
+    return true;
+  }
+  const row = await super.findByFilter({ signalId, bucketName, memoryId }) as IMemoryRow | null;
+  if (row) {
+    await this.memoryCacheService.setMemoryEntryId(row);
+    return true;
+  }
+  return false;
+};
+```
+
+`listEntries` returns all non-removed documents for a `(signalId, bucketName)` pair, providing the full `IMemoryRow` objects (including `payload`) rather than just the keys:
+
+```typescript
+public listEntries = async (
+  signalId: string,
+  bucketName: string,
+): Promise<IMemoryRow[]> => {
+  return await super.findAll({ signalId, bucketName, removed: false }) as IMemoryRow[];
+};
+```

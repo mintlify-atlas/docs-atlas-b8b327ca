@@ -1,0 +1,144 @@
+---
+title: "Configuration Reference: Environment Variables and Connection Settings"
+sidebarTitle: "Configuration"
+description: "Complete reference for all environment variables and configuration parameters in backtest-kit-redis-mongo-docker, including Redis, MongoDB, and backtest-kit runtime settings."
+---
+
+All runtime behaviour in `backtest-kit-redis-mongo-docker` is controlled through environment variables. Infrastructure connection settings (Redis host, MongoDB URI, etc.) are read once at startup from `src/config/params.ts` and defaulted to localhost values suitable for local development. Container runtime variables control the backtest-kit CLI mode, strategy selection, and optional integrations. A `.env` file at the project root is used by both the CLI toolchain and Docker Compose.
+
+## Infrastructure Configuration
+
+The following variables are defined in `src/config/params.ts`:
+
+```typescript
+declare function parseInt(value: unknown): number;
+
+export const CC_REDIS_HOST = process.env.CC_REDIS_HOST || "127.0.0.1";
+export const CC_REDIS_PORT = parseInt(process.env.CC_REDIS_PORT) || 6379;
+export const CC_REDIS_USER = process.env.CC_REDIS_USER || "default";
+export const CC_REDIS_PASSWORD = process.env.CC_REDIS_PASSWORD || "mysecurepassword";
+
+export const CC_MONGO_CONNECTION_STRING =
+  process.env.CC_MONGO_CONNECTION_STRING ||
+  "mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000";
+```
+
+<ParamField path="CC_REDIS_HOST" type="string" default="127.0.0.1">
+  Hostname or IP address of the Redis server. When running inside Docker and connecting to a Redis instance on the host machine, use `host.docker.internal` instead of `127.0.0.1`.
+</ParamField>
+
+<ParamField path="CC_REDIS_PORT" type="number" default="6379">
+  TCP port on which Redis is listening. The value is parsed with `parseInt`; non-numeric values fall back to `6379`.
+</ParamField>
+
+<ParamField path="CC_REDIS_USER" type="string" default="default">
+  Redis ACL username. The value `"default"` corresponds to the built-in Redis user that is active when no explicit ACL configuration is present.
+</ParamField>
+
+<ParamField path="CC_REDIS_PASSWORD" type="string" default="mysecurepassword">
+  Redis authentication password. The default value matches the password configured in the reference Docker Compose setup. **Change this in production.**
+</ParamField>
+
+<ParamField path="CC_MONGO_CONNECTION_STRING" type="string" default="mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000">
+  Full Mongoose connection URI including database name and query parameters. The `wtimeoutMS=15000` parameter sets a 15-second write concern timeout. When connecting from inside a Docker container to a MongoDB instance on the host, replace `localhost` with `host.docker.internal`.
+</ParamField>
+
+## `.env.example`
+
+The project ships an `.env.example` file showing the values required when the application runs inside Docker and connects to services on the host machine:
+
+```bash
+CC_REDIS_HOST=host.docker.internal
+CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-kit?wtimeoutMS=15000
+```
+
+Copy `.env.example` to `.env` and adjust as needed. The `dotenv-cli` dev dependency loads this file automatically when using `npm run start:repl`. Docker Compose loads it via the `env_file: .env` directive.
+
+**When to use `host.docker.internal` vs `127.0.0.1`:**
+
+| Scenario | Host value |
+|---|---|
+| Running directly on the host (CLI, `npm start`) | `127.0.0.1` (default) |
+| Running inside Docker, services on host | `host.docker.internal` |
+| All services in the same Docker Compose network | Service name (e.g. `redis`, `mongo`) |
+
+## Container Runtime Variables
+
+These variables are forwarded into the container via the `environment` section of `docker-compose.yaml`:
+
+```yaml
+environment:
+  - MODE
+  - STRATEGY_FILE
+  - SYMBOL
+  - STRATEGY
+  - EXCHANGE
+  - FRAME
+  - UI
+  - TELEGRAM
+  - VERBOSE
+  - NO_CACHE
+  - NO_FLUSH
+  - ENTRY
+```
+
+| Variable | Description |
+|---|---|
+| `MODE` | Execution mode — e.g. `backtest`, `live`, `paper` |
+| `STRATEGY_FILE` | Path to the compiled strategy bundle (e.g. `./build/index.cjs`) |
+| `SYMBOL` | Trading symbol to run against (e.g. `TRXUSDT`) |
+| `STRATEGY` | Strategy name identifier |
+| `EXCHANGE` | Exchange name identifier |
+| `FRAME` | Frame name identifier |
+| `UI` | Set to `1` to enable the backtest-kit web UI on port 60050 |
+| `TELEGRAM` | Set to `1` to enable Telegram notifications |
+| `VERBOSE` | Set to `1` for verbose logging output |
+| `NO_CACHE` | Set to `1` to disable Redis cache reads on startup |
+| `NO_FLUSH` | Set to `1` to skip flushing Redis keys on startup |
+| `ENTRY` | Set to `1` to trigger the entry script in `src/main/` |
+
+## npm Scripts
+
+| Script | Command | Description |
+|---|---|---|
+| `build` | `rollup -c` | Compiles TypeScript source to `./build/index.cjs` using the Rollup config |
+| `start` | `npm run build && node ./node_modules/@backtest-kit/cli/build/index.mjs` | Builds then starts the backtest-kit CLI |
+| `start:debug` | `npm run build && node --inspect-brk ./node_modules/@backtest-kit/cli/build/index.mjs` | Builds then starts the CLI with the Node.js inspector paused at the first line — attach a debugger before execution continues |
+| `start:repl` | `dotenv -e .env -- npm run build && node -e "require('./build/index.cjs')" --interactive` | Builds then opens an interactive Node.js REPL with the bundle pre-loaded and `.env` applied |
+| `start:docker` | `npm run build && cross-env MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d` | Builds and launches the full Docker Compose stack in detached mode with backtest mode, entry, and UI enabled |
+| `stop:docker` | `docker-compose down` | Stops and removes the Docker Compose stack |
+
+## Docker Compose Service
+
+The `docker-compose.yaml` defines a single `backtest` service:
+
+```yaml
+version: '3.8'
+
+services:
+  backtest:
+    image: tripolskypetr/backtest-kit
+    platform: linux/amd64
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    container_name: backtest-kit-redis-mongo-docker
+    ports:
+      - "60050:60050"
+    restart: unless-stopped
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:60050/api/v1/health/health_check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+Key points:
+- **`extra_hosts`** — maps `host.docker.internal` to the host gateway so the container can reach MongoDB and Redis running on the host machine.
+- **Port 60050** — the backtest-kit web UI is exposed on this port.
+- **Volume mount** — the entire project directory is mounted at `/workspace` so the container runs the locally-built `./build/index.cjs` without rebuilding the image.
+- **Healthcheck** — polls the `/api/v1/health/health_check` endpoint every 30 seconds.

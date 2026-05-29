@@ -1,0 +1,179 @@
+---
+title: "MongoService: Mongoose Connection Management"
+sidebarTitle: "MongoService"
+description: "Reference for the MongoService class that manages the Mongoose connection lifecycle, including waitForInit() and connection string configuration."
+---
+
+`MongoService` (exported as `MongooseService`) is the infrastructure service responsible for establishing and supervising the Mongoose connection to MongoDB. It is registered in the IoC container as a singleton and exposes a single public method — `waitForInit()` — that all database adapters call before performing any read or write operation. Because the method is wrapped with `singleshot` from `functools-kit`, the connection is initiated at most once no matter how many adapters call it concurrently; every subsequent caller receives the same resolved promise.
+
+## Implementation
+
+```typescript
+import { connect, ConnectionStates } from "mongoose";
+
+import { CC_MONGO_CONNECTION_STRING } from "../../../config/params";
+import { errorData, singleshot, sleep } from "functools-kit";
+import { inject } from "../../core/di";
+import LoggerService from "./LoggerService";
+import TYPES from "../../core/types";
+
+const getMongoose = singleshot(
+  async () => await connect(CC_MONGO_CONNECTION_STRING)
+);
+
+type Mongoose = Awaited<ReturnType<typeof getMongoose>>;
+
+const CONNECTED_STATE: ConnectionStates = 1;
+
+const CONNECTION_TIMEOUT = 15_000;
+const TIMEOUT_SYMBOL = Symbol("timeout");
+
+const waitForConnect = (mongoose: Mongoose, self: MongooseService) =>
+  new Promise<void>((resolve) => {
+    mongoose.connection.on("connected", () => {
+      self.loggerService.log("mongooseService Mongo connected to the database");
+      resolve();
+    });
+  });
+
+export class MongooseService {
+
+  readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+  public waitForInit = singleshot(async () => {
+    this.loggerService.log("mongooseService waitForInit");
+    const mongoose = await getMongoose();
+    if (mongoose.connection.readyState === CONNECTED_STATE) {
+      return mongoose;
+    }
+    const result = await Promise.race([
+      waitForConnect(mongoose, this),
+      sleep(CONNECTION_TIMEOUT).then(() => TIMEOUT_SYMBOL),
+    ]);
+    if (result === TIMEOUT_SYMBOL) {
+      this.waitForInit.clear();
+      throw new Error("Mongoose connection timeout");
+    }
+    return mongoose;
+  });
+
+  protected init = async () => {
+    this.loggerService.log("mongooseService init");
+
+    const mongoose = await this.waitForInit();
+
+    mongoose.connection.on("connected", () => {
+      this.loggerService.log("mongooseService Mongo connected to the database");
+    });
+
+    mongoose.connection.on("error", (err) => {
+      this.loggerService.log("mongooseService Mongo error", {
+        error: errorData(err),
+      });
+      throw new (class extends Error {
+        constructor() {
+          super("mongooseService Mongo error");
+        }
+        originalError = errorData(err);
+      })();
+    });
+
+    mongoose.connection.on("disconnected", () => {
+      this.loggerService.log("mongooseService disconnected from the database.");
+    });
+
+    mongoose.connection.on("reconnected", () => {
+      this.loggerService.log("mongooseService reconnected to the database.");
+    });
+
+    process.on("SIGINT", async () => {
+      await mongoose.connection.close();
+    });
+  };
+}
+
+export default MongooseService;
+```
+
+## Constructor
+
+`MongooseService` takes no constructor arguments. It is instantiated by the IoC container (`di-factory`) and receives its `loggerService` dependency via property injection:
+
+```typescript
+readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+```
+
+You never `new MongooseService()` directly; access it through `ioc.mongoService`.
+
+## Methods
+
+### `waitForInit(): Promise<void>`
+
+Establishes the Mongoose connection to MongoDB. Safe to call multiple times — subsequent calls resolve immediately against the already-settled promise thanks to the `singleshot` wrapper.
+
+The method races the connection event against a **15-second timeout**. If the timeout fires before the `connected` event, `waitForInit.clear()` resets the singleshot gate so the next call will attempt a fresh connection, and the method throws `Error("Mongoose connection timeout")`.
+
+**Usage from `src/main/backtest.ts`:**
+
+```typescript
+await ioc.mongoService.waitForInit();
+await ioc.redisService.waitForInit();
+```
+
+## Connection String Configuration
+
+The connection URI is read from the `CC_MONGO_CONNECTION_STRING` environment variable (defined in `src/config/params.ts`):
+
+```typescript
+export const CC_MONGO_CONNECTION_STRING =
+  process.env.CC_MONGO_CONNECTION_STRING ||
+  "mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000";
+```
+
+| Variable | Default |
+|---|---|
+| `CC_MONGO_CONNECTION_STRING` | `mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000` |
+
+<Note>
+  The default connection string includes `wtimeoutMS=15000`, which sets a **15-second write concern timeout**. This means any write operation that cannot be acknowledged within 15 seconds will fail rather than hang indefinitely. Adjust this value in production environments where network latency to the MongoDB replica set may be higher.
+</Note>
+
+## The `waitForInfra()` Pattern
+
+`src/config/setup.ts` defines a shared `waitForInfra()` singleshot that gates **every** persist adapter on both `mongoService` and `redisService` being ready:
+
+```typescript
+const waitForInfra = singleshot(
+  async () => {
+    await Promise.all([
+      ioc.mongoService.waitForInit(),
+      ioc.redisService.waitForInit(),
+    ]);
+  }
+);
+```
+
+Each adapter's `waitForInit(initial: boolean)` calls `waitForInfra()` only on the first invocation (`initial === true`):
+
+```typescript
+async waitForInit(initial: boolean) {
+  if (!initial) {
+    return;
+  }
+  await waitForInfra();
+}
+```
+
+This ensures that MongoDB and Redis connections are both fully established before any adapter performs I/O, and the cost is paid exactly once across the entire process lifetime.
+
+## Connection Lifecycle Events
+
+After `waitForInit()` resolves, `MongooseService` registers listeners on the Mongoose connection for operational visibility:
+
+| Event | Behaviour |
+|---|---|
+| `connected` | Logs a confirmation message |
+| `error` | Logs the error payload and rethrows as a typed error with `originalError` |
+| `disconnected` | Logs a warning |
+| `reconnected` | Logs a recovery message |
+| `SIGINT` | Gracefully closes the connection before the process exits |

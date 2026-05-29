@@ -1,0 +1,127 @@
+---
+title: "Strategy Structure and Entry Points in backtest-kit"
+sidebarTitle: "Structure"
+description: "How trading strategies are organized in backtest-kit-redis-mongo-docker: entry points, strategy schemas, signal logic, and the rollup build pipeline."
+---
+
+The `backtest-kit-redis-mongo-docker` project separates strategy logic from infrastructure wiring. Strategy code lives under `src/logic/`, with each strategy and its time-frame definition in their own files. The three entry points in `src/main/` (`backtest.ts`, `paper.ts`, `live.ts`) bootstrap the application for their respective modes, wire up MongoDB/Redis adapters, then delegate to the strategy module. Rollup bundles the `src/` tree into a single `./build/index.cjs` artefact that backtest-kit loads at runtime via the `STRATEGY_FILE` environment variable or the `--ui` CLI flag.
+
+## Project layout
+
+```
+src/
+  logic/
+    strategy/jan_2026.strategy.ts  # addStrategySchema() — signal generation logic
+    frame/jan_2026.frame.ts        # addFrameSchema() — time window definition
+    index.ts                       # re-exports
+  main/
+    backtest.ts                    # entry point for backtest mode
+    paper.ts                       # entry point for paper mode
+    live.ts                        # entry point for live mode
+  enum/
+    ExchangeName.ts
+    FrameName.ts
+    StrategyName.ts
+modules/
+  backtest.module.ts              # addExchangeSchema() for backtest
+  live.module.ts                  # addExchangeSchema() for live/paper
+  paper.module.ts
+assets/
+  entry.jsonl                     # signal entry data read by the strategy
+```
+
+## Strategy schema (`addStrategySchema`)
+
+`src/logic/strategy/jan_2026.strategy.ts` registers a strategy by calling `addStrategySchema`. The `getSignal` callback is invoked by backtest-kit on every candle tick for each tracked symbol. It must return a signal object (including position direction and risk parameters) or `null` if no trade should be opened.
+
+```typescript
+addStrategySchema({
+  strategyName: "jan_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    const signal = getActiveSignal(symbol, when);
+    if (!signal) return null;
+    // ... price validation and position logic
+    return {
+      position,
+      ...Position.moonbag({ position, currentPrice, percentStopLoss: HARD_STOP }),
+      minuteEstimatedTime: 24 * 60,
+      note: signal.note,
+    };
+  },
+});
+```
+
+Inside `getSignal` the strategy:
+
+1. Looks up the active signal for the current `symbol` / `when` pair using `getActiveSignal`.
+2. Validates that the 1-minute close price falls within the signal's `entry.from`–`entry.to` range.
+3. Reads two 4-hour candles to derive a range midpoint and determine whether the trade is `"long"` or `"short"`.
+4. Returns a position object built with `Position.moonbag`, a 24-hour estimated hold time, and the signal note.
+
+## The `SIGNALS` array
+
+At module initialisation time the strategy file reads `./assets/entry.jsonl` synchronously:
+
+```typescript
+const SIGNALS: SignalEntryModel[] = readFileSync("./assets/entry.jsonl", "utf-8")
+  .split("\n")
+  .filter(Boolean)
+  .map((line) => JSON.parse(line));
+```
+
+Each line is a JSON-encoded `SignalEntryModel` with the following shape:
+
+| Field | Type | Description |
+|---|---|---|
+| `symbol` | `string` | Trading pair, e.g. `"TRXUSDT"` |
+| `publishedAt` | `string` | ISO-8601 timestamp for when the signal fires |
+| `entry.from` | `number` | Lower bound of the valid entry price range |
+| `entry.to` | `number` | Upper bound of the valid entry price range |
+| `note` | `string` | Human-readable annotation stored on the position |
+
+The helper `getActiveSignal(symbol, when)` aligns `publishedAt` to the nearest 1-minute boundary and checks whether it matches the current simulation timestamp.
+
+## Active-ping hooks
+
+Two `listenActivePing` hooks run on every heartbeat for open positions:
+
+**Trailing take** — closes the position once it has pulled back from its peak by more than `TRAILING_TAKE` (1 %):
+
+```typescript
+listenActivePing(async ({ symbol }) => {
+  const peakProfitDistance = await getPositionHighestProfitDistancePnlPercentage(symbol);
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < 0) return;
+  if (peakProfitDistance < TRAILING_TAKE) return;
+  await commitClosePending(symbol, { id: 'unknown', note: '# Closed by trailing take' });
+});
+```
+
+**Peak staleness** — closes the position when it has been profitable (above `PEAK_STALENESS_SINCE_PROFIT` = 1 %) for longer than `PEAK_STALENESS_SINCE_MINUTES` (240 min = 4 hours) without closing naturally. This guards against positions that spike once and then stagnate.
+
+## Build pipeline
+
+Rollup reads `src/index.ts` (which re-exports both the frame and strategy modules) and bundles everything into `./build/index.cjs` in CommonJS format:
+
+```javascript
+// rollup.config.mjs (simplified)
+{
+  input: "src/index.ts",
+  output: [{ file: "build/index.cjs", format: "commonjs" }],
+  plugins: [peerDepsExternal({ includeDependencies: true }), typescript(...)],
+}
+```
+
+All `backtest-kit` imports are treated as peer-dependency externals so the bundle stays small. After running `rollup -c`, point backtest-kit at the bundle:
+
+```bash
+# via environment variable
+STRATEGY_FILE=./build/index.cjs backtest-kit start
+
+# or via CLI flag
+backtest-kit start --ui ./build/index.cjs
+```
+
+<Note>
+  Strategy names, frame names, and exchange names are defined as TypeScript enums in the `src/enum/` directory (`StrategyName.ts`, `FrameName.ts`, `ExchangeName.ts`). Always use these enum values rather than raw strings to keep identifiers consistent across entry points, module registrations, and strategy schemas.
+</Note>

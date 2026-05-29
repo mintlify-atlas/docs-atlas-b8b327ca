@@ -1,0 +1,221 @@
+---
+title: "PersistSignalAdapter: Live Signal State Persistence"
+sidebarTitle: "Signal"
+description: "Reference for PersistSignalAdapter and SignalDbService that maintain live signal state per (symbol, strategyName, exchangeName) context with Redis caching."
+---
+
+The Signal adapter stores the **active signal state** for each trading context. A signal state is a snapshot of what the strategy most recently decided for a given `(symbol, strategyName, exchangeName)` triplet — open position direction, entry price, stop levels, and any other fields your `ISignalRow` carries. The adapter ensures that after a process restart the engine can reload exactly the signal it left off with, without re-running the full strategy history.
+
+The closely related **Schedule adapter** covers the same context key but holds a _pending scheduled signal_ — a deferred action the engine plans to execute on the next bar tick — rather than the current live state.
+
+---
+
+## Signal adapter
+
+### `IPersistSignalInstance` implementation
+
+```typescript
+PersistSignalAdapter.usePersistSignalAdapter(class implements IPersistSignalInstance {
+  constructor(
+    readonly symbol: string,
+    readonly strategyName: string,
+    readonly exchangeName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readSignalData(): Promise<ISignalRow | null> {
+    const row = await ioc.signalDbService.findByContext(
+      this.symbol, this.strategyName, this.exchangeName,
+    );
+    return row ? row.payload : null;
+  }
+
+  async writeSignalData(signalRow: ISignalRow | null): Promise<void> {
+    await ioc.signalDbService.upsert(
+      this.symbol, this.strategyName, this.exchangeName, signalRow,
+    );
+  }
+});
+```
+
+Context key: `(symbol, strategyName, exchangeName)`.
+
+### Signal Mongoose schema
+
+From `src/schema/Signal.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { ISignalRow } from "backtest-kit";
+
+interface ISignalDto {
+  symbol: string;
+  strategyName: string;
+  exchangeName: string;
+  payload: ISignalRow;
+}
+
+interface SignalDocument extends ISignalDto, Document {}
+
+interface ISignalRowDoc extends ISignalDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const SignalSchema: Schema<SignalDocument> = new Schema(
+  {
+    symbol:       { type: String, required: true, index: true },
+    strategyName: { type: String, required: true, index: true },
+    exchangeName: { type: String, required: true, index: true },
+    payload:      { type: Schema.Types.Mixed, required: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+SignalSchema.index(
+  { symbol: 1, strategyName: 1, exchangeName: 1 },
+  { unique: true }
+);
+
+const SignalModel = mongoose.model<SignalDocument>("signal-items", SignalSchema);
+```
+
+`minimize: false` is required so that Mongoose does not strip empty objects from `payload`, preserving the full shape of sparse signal objects.
+
+### `SignalDbService` — atomic upsert and Redis-cached read
+
+**`upsert`** uses `$set` with `upsert: true` so that any `payload` value — including `null` (signal cleared) — is accepted:
+
+```typescript
+public upsert = async (
+  symbol: string,
+  strategyName: string,
+  exchangeName: string,
+  payload: ISignalRow | null,
+): Promise<void> => {
+  const filter = { symbol, strategyName, exchangeName };
+  const document = await SignalModel.findOneAndUpdate(
+    filter,
+    { $set: { payload } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as ISignalRowDoc;
+  await this.signalCacheService.setSignalId(result);
+};
+```
+
+**`findByContext`** checks the Redis cache first. On a hit it resolves the `_id` and calls `findById` (an O(1) indexed lookup). On a miss — or if Redis is temporarily unavailable — it falls back to a full MongoDB filter query, then primes the cache:
+
+```typescript
+public findByContext = async (
+  symbol: string,
+  strategyName: string,
+  exchangeName: string,
+): Promise<ISignalRowDoc | null> => {
+  try {
+    const cachedId = await this.signalCacheService.getSignalId(
+      symbol, strategyName, exchangeName,
+    );
+    if (cachedId) {
+      return await super.findById(cachedId) as ISignalRowDoc;
+    }
+  } catch {
+    void 0;
+  }
+  const result = await super.findByFilter({
+    symbol, strategyName, exchangeName,
+  }) as ISignalRowDoc | null;
+  if (result) {
+    await this.signalCacheService.setSignalId(result);
+  }
+  return result;
+};
+```
+
+<Note>
+The Signal adapter has **no `when: Date` column**. Signal state represents the current live state of the strategy — it is not filtered by time during backtests and carries no look-ahead bias concern.
+</Note>
+
+---
+
+## Schedule adapter
+
+The Schedule adapter shares the exact same context key and Redis-cache pattern as Signal, but stores `IScheduledSignalRow | null` — the deferred action the engine will execute on the next tick — in the `schedule-items` collection.
+
+### `IPersistScheduleInstance` implementation
+
+```typescript
+PersistScheduleAdapter.usePersistScheduleAdapter(class implements IPersistScheduleInstance {
+  constructor(
+    readonly symbol: string,
+    readonly strategyName: string,
+    readonly exchangeName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readScheduleData(): Promise<IScheduledSignalRow | null> {
+    const row = await ioc.scheduleDbService.findByContext(
+      this.symbol, this.strategyName, this.exchangeName,
+    );
+    return row ? row.payload : null;
+  }
+
+  async writeScheduleData(scheduleRow: IScheduledSignalRow | null): Promise<void> {
+    await ioc.scheduleDbService.upsert(
+      this.symbol, this.strategyName, this.exchangeName, scheduleRow,
+    );
+  }
+});
+```
+
+### Schedule Mongoose schema
+
+From `src/schema/Schedule.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { IScheduledSignalRow } from "backtest-kit";
+
+interface IScheduleDto {
+  symbol: string;
+  strategyName: string;
+  exchangeName: string;
+  payload: IScheduledSignalRow;
+}
+
+interface ScheduleDocument extends IScheduleDto, Document {}
+
+interface IScheduleRow extends IScheduleDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const ScheduleSchema: Schema<ScheduleDocument> = new Schema(
+  {
+    symbol:       { type: String, required: true, index: true },
+    strategyName: { type: String, required: true, index: true },
+    exchangeName: { type: String, required: true, index: true },
+    payload:      { type: Schema.Types.Mixed, required: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+ScheduleSchema.index(
+  { symbol: 1, strategyName: 1, exchangeName: 1 },
+  { unique: true }
+);
+
+const ScheduleModel = mongoose.model<ScheduleDocument>("schedule-items", ScheduleSchema);
+```
+
+The schema is structurally identical to `SignalSchema` — only the Mongoose model name and the payload type differ. Setting `payload` to `null` via `writeScheduleData(null)` is the standard way to cancel a pending schedule.

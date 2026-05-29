@@ -1,0 +1,337 @@
+---
+title: "Risk, Partial, and Breakeven Persist Adapters"
+sidebarTitle: "Risk / Partial / Breakeven"
+description: "Reference for PersistRiskAdapter, PersistPartialAdapter, and PersistBreakevenAdapter — signal-affecting adapters that store position data with look-ahead bias protection."
+---
+
+Risk, Partial, and Breakeven are the three **signal-affecting adapters**. They store data that directly influences open position management — live risk positions, partial profit/loss price levels, and the breakeven-reached flag. Because this data can change the outcome of a backtest, all three carry a `when: Date` argument on their write methods and a `when: number` field in MongoDB. The engine uses `when` to prevent look-ahead bias: when replaying history, writes that would have happened "in the future" relative to the current simulation timestamp are withheld.
+
+---
+
+## Risk adapter
+
+Stores a snapshot of all active positions for a named risk manager.
+
+**Context key:** `(riskName, exchangeName)`  
+**Collection:** `risk-items`
+
+### `IPersistRiskInstance` implementation
+
+```typescript
+PersistRiskAdapter.usePersistRiskAdapter(class implements IPersistRiskInstance {
+  constructor(
+    readonly riskName: string,
+    readonly exchangeName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readPositionData(_when: Date): Promise<RiskData> {
+    const row = await ioc.riskDbService.findByContext(
+      this.riskName, this.exchangeName,
+    );
+    return row ? row.positions : [];
+  }
+
+  async writePositionData(positions: RiskData, when: Date): Promise<void> {
+    await ioc.riskDbService.upsert(
+      this.riskName, this.exchangeName, positions, when,
+    );
+  }
+});
+```
+
+`readPositionData` returns `[]` (empty array) when no document exists for the context, so callers always receive a valid `RiskData` value.
+
+### Risk Mongoose schema
+
+From `src/schema/Risk.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { RiskData } from "backtest-kit";
+
+interface IRiskDto {
+  riskName: string;
+  exchangeName: string;
+  positions: RiskData;
+  when: number;
+}
+
+interface RiskDocument extends IRiskDto, Document {}
+
+interface IRiskRow extends IRiskDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const RiskSchema: Schema<RiskDocument> = new Schema(
+  {
+    riskName:     { type: String, required: true, index: true },
+    exchangeName: { type: String, required: true, index: true },
+    positions:    { type: Schema.Types.Mixed, required: true, default: [] },
+    when:         { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+RiskSchema.index({ riskName: 1, exchangeName: 1 }, { unique: true });
+
+const RiskModel = mongoose.model<RiskDocument>("risk-items", RiskSchema);
+```
+
+`positions` stores `RiskData` (an array of position objects) as `Schema.Types.Mixed`. The `when` field is stored as a Unix millisecond integer (`Date.getTime()`).
+
+### `RiskDbService` — upsert with `when`
+
+```typescript
+public upsert = async (
+  riskName: string,
+  exchangeName: string,
+  positions: RiskData,
+  when: Date,
+): Promise<void> => {
+  const filter = { riskName, exchangeName };
+  const document = await RiskModel.findOneAndUpdate(
+    filter,
+    { $set: { positions, when: when.getTime() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IRiskRow;
+  await this.riskCacheService.setRiskId(result);
+};
+```
+
+`findByContext` follows the same Redis-cache-then-MongoDB-fallback pattern as all other adapters.
+
+---
+
+## Partial adapter
+
+Stores the profit/loss price levels for a specific open signal, enabling partial take-profit logic to survive process restarts.
+
+**Context key:** `(symbol, strategyName, exchangeName, signalId)`  
+**Collection:** `partial-items`
+
+### `IPersistPartialInstance` implementation
+
+```typescript
+PersistPartialAdapter.usePersistPartialAdapter(class implements IPersistPartialInstance {
+  constructor(
+    readonly symbol: string,
+    readonly strategyName: string,
+    readonly exchangeName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readPartialData(signalId: string, _when: Date): Promise<PartialData> {
+    const row = await ioc.partialDbService.findByContext(
+      this.symbol, this.strategyName, this.exchangeName, signalId,
+    );
+    return row ? row.payload : {};
+  }
+
+  async writePartialData(
+    data: PartialData,
+    signalId: string,
+    when: Date,
+  ): Promise<void> {
+    await ioc.partialDbService.upsert(
+      this.symbol, this.strategyName, this.exchangeName, signalId, data, when,
+    );
+  }
+});
+```
+
+Note that `signalId` is passed as a method argument — not a constructor field — because the constructor only captures the trading context. The same `IPersistPartialInstance` instance may serve multiple signal IDs over its lifetime.
+
+### Partial Mongoose schema
+
+From `src/schema/Partial.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { PartialData } from "backtest-kit";
+
+interface IPartialDto {
+  symbol: string;
+  strategyName: string;
+  exchangeName: string;
+  signalId: string;
+  payload: PartialData;
+  when: number;
+}
+
+interface PartialDocument extends IPartialDto, Document {}
+
+interface IPartialRow extends IPartialDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const PartialSchema: Schema<PartialDocument> = new Schema(
+  {
+    symbol:       { type: String, required: true, index: true },
+    strategyName: { type: String, required: true, index: true },
+    exchangeName: { type: String, required: true, index: true },
+    signalId:     { type: String, required: true, index: true },
+    payload:      { type: Schema.Types.Mixed, required: true, default: {} },
+    when:         { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+PartialSchema.index(
+  { symbol: 1, strategyName: 1, exchangeName: 1, signalId: 1 },
+  { unique: true }
+);
+
+const PartialModel = mongoose.model<PartialDocument>("partial-items", PartialSchema);
+```
+
+### `PartialDbService` — upsert with `when`
+
+```typescript
+public upsert = async (
+  symbol: string,
+  strategyName: string,
+  exchangeName: string,
+  signalId: string,
+  payload: PartialData,
+  when: Date,
+): Promise<void> => {
+  const filter = { symbol, strategyName, exchangeName, signalId };
+  const document = await PartialModel.findOneAndUpdate(
+    filter,
+    { $set: { payload, when: when.getTime() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IPartialRow;
+  await this.partialCacheService.setPartialId(result);
+};
+```
+
+---
+
+## Breakeven adapter
+
+Stores the breakeven-reached flag for a specific signal. Once breakeven is hit, the stop-loss is moved to entry price; this adapter persists that state across restarts.
+
+**Context key:** `(symbol, strategyName, exchangeName, signalId)`  
+**Collection:** `breakeven-items`
+
+### `IPersistBreakevenInstance` implementation
+
+```typescript
+PersistBreakevenAdapter.usePersistBreakevenAdapter(class implements IPersistBreakevenInstance {
+  constructor(
+    readonly symbol: string,
+    readonly strategyName: string,
+    readonly exchangeName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readBreakevenData(signalId: string, _when: Date): Promise<BreakevenData> {
+    const row = await ioc.breakevenDbService.findByContext(
+      this.symbol, this.strategyName, this.exchangeName, signalId,
+    );
+    return row ? row.payload : {};
+  }
+
+  async writeBreakevenData(
+    data: BreakevenData,
+    signalId: string,
+    when: Date,
+  ): Promise<void> {
+    await ioc.breakevenDbService.upsert(
+      this.symbol, this.strategyName, this.exchangeName, signalId, data, when,
+    );
+  }
+});
+```
+
+### Breakeven Mongoose schema
+
+From `src/schema/Breakeven.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { BreakevenData } from "backtest-kit";
+
+interface IBreakevenDto {
+  symbol: string;
+  strategyName: string;
+  exchangeName: string;
+  signalId: string;
+  payload: BreakevenData;
+  when: number;
+}
+
+interface BreakevenDocument extends IBreakevenDto, Document {}
+
+interface IBreakevenRow extends IBreakevenDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const BreakevenSchema: Schema<BreakevenDocument> = new Schema(
+  {
+    symbol:       { type: String, required: true, index: true },
+    strategyName: { type: String, required: true, index: true },
+    exchangeName: { type: String, required: true, index: true },
+    signalId:     { type: String, required: true, index: true },
+    payload:      { type: Schema.Types.Mixed, required: true, default: {} },
+    when:         { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+BreakevenSchema.index(
+  { symbol: 1, strategyName: 1, exchangeName: 1, signalId: 1 },
+  { unique: true }
+);
+
+const BreakevenModel = mongoose.model<BreakevenDocument>("breakeven-items", BreakevenSchema);
+```
+
+The schema is structurally identical to `PartialSchema`. Both use a four-field compound unique index that includes `signalId`, so each open signal gets its own isolated document.
+
+### `BreakevenDbService` — upsert with `when`
+
+```typescript
+public upsert = async (
+  symbol: string,
+  strategyName: string,
+  exchangeName: string,
+  signalId: string,
+  payload: BreakevenData,
+  when: Date,
+): Promise<void> => {
+  const filter = { symbol, strategyName, exchangeName, signalId };
+  const document = await BreakevenModel.findOneAndUpdate(
+    filter,
+    { $set: { payload, when: when.getTime() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IBreakevenRow;
+  await this.breakevenCacheService.setBreakevenId(result);
+};
+```
+
+<Note>
+All three adapters store `when` as `Date.getTime()` (Unix milliseconds) rather than a BSON `Date`. This allows the engine to compare timestamps with simple numeric comparison during backtesting without timezone or precision issues.
+</Note>

@@ -1,0 +1,121 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "backtest-kit Redis+MongoDB Docker",
+  "projectDescription": "A production-grade persistence layer for backtest-kit that replaces file-based storage with MongoDB as the source of truth and Redis as an O(1) lookup cache, packaged with docker-compose for one-command deploys.",
+  "theme": "aspen",
+  "primaryColor": "#2563EB",
+  "lightColor": "#3B82F6",
+  "darkColor": "#1D4ED8",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/atomicity",
+              "architecture/redis-cache",
+              "architecture/look-ahead-bias"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/docker-compose",
+              "deployment/environment",
+              "deployment/running-modes"
+            ]
+          },
+          {
+            "group": "Strategy Development",
+            "pages": [
+              "strategy/structure",
+              "strategy/frames",
+              "strategy/exchange-adapters"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Persist Adapters",
+            "pages": [
+              "reference/adapters-overview",
+              "reference/candle-adapter",
+              "reference/signal-adapter",
+              "reference/risk-partial-breakeven",
+              "reference/storage-notification-log",
+              "reference/measure-interval-memory",
+              "reference/recent-state-session"
+            ]
+          },
+          {
+            "group": "Core Services",
+            "pages": [
+              "reference/mongo-service",
+              "reference/redis-service",
+              "reference/base-crud",
+              "reference/base-map"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "reference/configuration",
+              "reference/schemas"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "15 custom IPersist* adapters implementing the full backtest-kit persistence contract on MongoDB + Redis",
+    "Atomic findOneAndUpdate upserts with compound unique indexes — eliminates E11000 duplicate key race conditions",
+    "Redis O(1) context-key → MongoDB _id cache with automatic cold-start backfill on cache miss",
+    "Look-ahead bias protection via indexed `when: Date` column on all signal-affecting adapters",
+    "Soft-delete semantics for Measure, Interval, and Memory adapters matching default file-based behavior",
+    "docker-compose layout: isolated MongoDB and Redis containers plus a full backtest-kit container",
+    "Three running modes: backtest, paper, and live — switchable via CLI flags or container env vars",
+    "CCXT Binance exchange adapter with OHLCV fetching, order book, and price/quantity formatting"
+  ],
+  "publicApiSurface": [
+    "PersistCandleAdapter.usePersistCandleAdapter()",
+    "PersistSignalAdapter.usePersistSignalAdapter()",
+    "PersistRiskAdapter.usePersistRiskAdapter()",
+    "PersistScheduleAdapter.usePersistScheduleAdapter()",
+    "PersistPartialAdapter.usePersistPartialAdapter()",
+    "PersistBreakevenAdapter.usePersistBreakevenAdapter()",
+    "PersistStorageAdapter.usePersistStorageAdapter()",
+    "PersistNotificationAdapter.usePersistNotificationAdapter()",
+    "PersistLogAdapter.usePersistLogAdapter()",
+    "PersistMeasureAdapter.usePersistMeasureAdapter()",
+    "PersistIntervalAdapter.usePersistIntervalAdapter()",
+    "PersistMemoryAdapter.usePersistMemoryAdapter()",
+    "PersistRecentAdapter.usePersistRecentAdapter()",
+    "PersistStateAdapter.usePersistStateAdapter()",
+    "PersistSessionAdapter.usePersistSessionAdapter()",
+    "BaseCRUD (create, update, findById, findByFilter, findAll, iterate, paginate)",
+    "BaseMap (get, set, delete, has, clear, toArray, iterate, keys, values, size)",
+    "MongoService.waitForInit()",
+    "RedisService.waitForInit()",
+    "addStrategySchema({ strategyName, getSignal })",
+    "addFrameSchema({ frameName, interval, startDate, endDate, note })",
+    "addExchangeSchema({ exchangeName, getCandles, getOrderBook, formatPrice, formatQuantity })",
+    "Backtest.background(symbol, { exchangeName, frameName, strategyName })",
+    "warmCandles({ exchangeName, from, to, interval, symbol })",
+    "waitForReady(initial: boolean)",
+    "getArgs() → { values: { entry, backtest, live, paper } }"
+  ]
+}

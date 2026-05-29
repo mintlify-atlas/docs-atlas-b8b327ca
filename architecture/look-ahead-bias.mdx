@@ -1,0 +1,114 @@
+---
+title: "Look-Ahead Bias Protection with Indexed when: Date Columns"
+sidebarTitle: "Look-Ahead Bias"
+description: "How backtest-kit-redis-mongo-docker stores simulation timestamps in MongoDB to let backtest-kit's bias filter verify that reads never see future data."
+---
+
+**Look-ahead bias** is a common backtesting defect where a strategy inadvertently uses information that would not have been available at the simulated point in time — for example, reading tomorrow's closing price when evaluating today's entry signal. Even a single data point leaking across the time boundary can produce unrealistically optimistic results that collapse entirely in live trading.
+
+`backtest-kit` 9.0+ added systematic protection against this defect: every adapter `write*` method that stores signal-affecting state now accepts a `when: Date` argument representing the *simulation timestamp* at which the data was produced. The persistence layer stores `when` as an indexed numeric column (`when: number`, milliseconds since epoch) so the bias filter can later verify that any read only observes records whose `when` is ≤ the current simulation time.
+
+## Which Adapters Carry `when`
+
+Not every adapter needs a `when` column. The rule is:
+
+- **Signal-affecting state** — data that can influence whether, when, or how a position is opened or closed — must carry `when`.
+- **Infrastructure or LLM-response caches** — data that is either time-independent or deliberately computed outside the simulation timeline — are exempt.
+
+| Adapter | Schema field | Notes |
+|---|---|---|
+| **Risk** | `when: Number` | Position exposure per exchange, time-dependent |
+| **Partial** | `when: Number` | Per-signal partial fill state, time-dependent |
+| **Breakeven** | `when: Number` | Per-signal breakeven price, time-dependent |
+| **Recent** | `when: Number` | Most-recent public signal row, time-dependent |
+| **State** | `when: Number` | Arbitrary per-signal state bucket, time-dependent |
+| **Session** | `when: Number` | Per-frame session data, time-dependent |
+| **Memory** | `when: Number` | Per-signal memory entries, time-dependent |
+| **Interval** | `when: Number` | Named interval trackers, time-dependent |
+| **Signal** | *(absent)* | Identity record; bias is tracked via `payload.when` inside backtest-kit |
+| **Schedule** | *(absent)* | Scheduling metadata; not directly signal-affecting |
+| **Measure** | *(absent)* | LLM / API response cache; intentionally exempt (see below) |
+| **Candle** | *(absent)* | Raw market data; immutable, bias is enforced by timestamp filter |
+| **Storage** | *(absent)* | Global completed-signal archive; read-only in bias context |
+| **Notification** | *(absent)* | UI notification log; not signal-affecting |
+| **Log** | *(absent)* | Debug log entries; not signal-affecting |
+
+## Schema Example — `StateSchema`
+
+`StateSchema` is representative of all time-tracked schemas. The `when` field is `Number` (ms since epoch), required, and indexed so the bias filter can issue range queries efficiently:
+
+```typescript
+// src/schema/State.schema.ts
+const StateSchema: Schema<StateDocument> = new Schema(
+  {
+    signalId:   { type: String, required: true, index: true },
+    bucketName: { type: String, required: true, index: true },
+    payload:    { type: Schema.Types.Mixed, required: true },
+    when:       { type: Number, required: true, index: true },  // ms since epoch
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+StateSchema.index({ signalId: 1, bucketName: 1 }, { unique: true });
+```
+
+The compound unique index on `(signalId, bucketName)` ensures at-most-one active state per signal/bucket pair, while the individual `index: true` on `when` enables range queries across the timeline.
+
+The same structure appears in every time-tracked schema:
+
+```typescript
+// src/schema/Risk.schema.ts
+RiskSchema fields: riskName, exchangeName, positions, when
+// Unique index: { riskName: 1, exchangeName: 1 }
+
+// src/schema/Interval.schema.ts
+IntervalSchema fields: bucket, entryKey, payload, removed, when
+// Unique index: { bucket: 1, entryKey: 1 }
+
+// src/schema/Memory.schema.ts
+MemorySchema fields: signalId, bucketName, memoryId, payload, removed, when
+// Unique index: { signalId: 1, bucketName: 1, memoryId: 1 }
+```
+
+## How `when` Is Stored
+
+`StateDbService.upsert` converts the `Date` object to an integer before persisting it, matching the `Number` schema type:
+
+```typescript
+// src/lib/services/db/StateDbService.ts
+public upsert = async (
+  signalId: string,
+  bucketName: string,
+  payload: StateData,
+  when: Date,
+): Promise<void> => {
+  const filter = { signalId, bucketName };
+  const document = await StateModel.findOneAndUpdate(
+    filter,
+    { $set: { payload, when: when.getTime() } },  // Date → ms epoch integer
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IStateRow;
+  await this.stateCacheService.setStateId(result);
+};
+```
+
+The integer representation (`Date.getTime()`) is portable, sortable, and directly comparable — a range query `{ when: { $lte: simulationTime } }` works without any date-parsing overhead.
+
+## Why Measure Is Intentionally Exempt
+
+`MeasureDbService.upsert` accepts a `_when: Date` parameter (note the leading underscore) in its adapter interface but does **not** persist it to MongoDB:
+
+```typescript
+// src/config/setup.ts — PersistMeasureAdapter registration
+async writeMeasureData(data: MeasureData, key: string, _when: Date): Promise<void> {
+  await ioc.measureDbService.upsert(this.bucket, key, data);
+  //                                              ↑ when is NOT forwarded
+}
+```
+
+`Measure` is designed as a **deterministic response cache** for expensive LLM calls or external API lookups. The same key always returns the same data regardless of simulation time — the response is not a function of the market state at a particular timestamp. Storing `when` for Measure would incorrectly imply that the data can go stale as the simulation clock advances, which is semantically wrong for this adapter. `MeasureSchema` therefore omits the `when` field entirely.
+
+<Warning>
+Removing the `when` field from any of the eight time-tracked schemas (Risk, Partial, Breakeven, Recent, State, Session, Memory, Interval) would break backtest-kit's internal bias filter. The filter relies on the presence of an indexed `when` column to issue `{ when: { $lte: simulationTimestamp } }` range queries. Without it, the framework cannot distinguish data written during a future candle from data written during the current one, and look-ahead bias checks will either throw or silently pass invalid data to the strategy.
+</Warning>

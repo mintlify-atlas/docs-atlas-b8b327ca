@@ -1,0 +1,384 @@
+---
+title: "Recent, State, and Session Persist Adapters"
+sidebarTitle: "Recent / State / Session"
+description: "Reference for PersistRecentAdapter, PersistStateAdapter, and PersistSessionAdapter — adapters for tracking signal history, per-signal state buckets, and strategy sessions."
+---
+
+Recent, State, and Session are the three **ongoing strategy state adapters**. They track what a strategy is currently doing — the most recently published signal for a context, arbitrary per-signal state keyed by bucket name, and the lifecycle data for a running strategy session. All three carry a `when: Date` column for look-ahead bias protection, and both State and Session expose a `dispose()` method that backtest-kit calls when the associated signal or session ends.
+
+<Note>
+`dispose()` is currently a no-op (`void 0`) in this implementation. The method exists to satisfy the `IPersistStateInstance` / `IPersistSessionInstance` interfaces. If your use case requires cleanup on signal/session teardown (e.g. soft-deleting state documents), override the body here.
+</Note>
+
+---
+
+## Recent adapter
+
+Stores the **last public signal** for a given context. The `recent-items` collection is typically used by dashboards or notification systems that need to display the most recent decision made by a strategy without re-scanning the full storage history.
+
+**Context key:** `(symbol, strategyName, exchangeName, frameName, backtest: boolean)`  
+**Collection:** `recent-items`
+
+### `IPersistRecentInstance` implementation
+
+```typescript
+PersistRecentAdapter.usePersistRecentAdapter(class implements IPersistRecentInstance {
+  constructor(
+    readonly symbol: string,
+    readonly strategyName: string,
+    readonly exchangeName: string,
+    readonly frameName: string,
+    readonly backtest: boolean,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readRecentData(): Promise<RecentData> {
+    const row = await ioc.recentDbService.findByContext(
+      this.symbol,
+      this.strategyName,
+      this.exchangeName,
+      this.frameName,
+      this.backtest,
+    );
+    return row ? row.payload : null;
+  }
+
+  async writeRecentData(signalRow: NonNullable<RecentData>, when: Date): Promise<void> {
+    await ioc.recentDbService.upsert(
+      this.symbol,
+      this.strategyName,
+      this.exchangeName,
+      this.frameName,
+      this.backtest,
+      signalRow,
+      when,
+    );
+  }
+});
+```
+
+`readRecentData` returns `null` when no document exists yet (no signal has been published for this context), which matches the `RecentData` type alias (`IPublicSignalRow | null`).
+
+### Recent Mongoose schema
+
+From `src/schema/Recent.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { IPublicSignalRow } from "backtest-kit";
+
+interface IRecentDto {
+  symbol: string;
+  strategyName: string;
+  exchangeName: string;
+  frameName: string;
+  backtest: boolean;
+  payload: IPublicSignalRow;
+  when: number;
+}
+
+interface RecentDocument extends IRecentDto, Document {}
+
+interface IRecentRow extends IRecentDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const RecentSchema: Schema<RecentDocument> = new Schema(
+  {
+    symbol:       { type: String, required: true, index: true },
+    strategyName: { type: String, required: true, index: true },
+    exchangeName: { type: String, required: true, index: true },
+    frameName:    { type: String, required: true, index: true },
+    backtest:     { type: Boolean, required: true, index: true },
+    payload:      { type: Schema.Types.Mixed, required: true },
+    when:         { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+RecentSchema.index(
+  { symbol: 1, strategyName: 1, exchangeName: 1, frameName: 1, backtest: 1 },
+  { unique: true }
+);
+
+const RecentModel = mongoose.model<RecentDocument>("recent-items", RecentSchema);
+```
+
+The five-field compound unique index ensures exactly one "most recent signal" document per context and mode combination. Like Storage and Notification, Recent is partitioned by `backtest` so that backtest results do not overwrite live state.
+
+### `RecentDbService` — upsert with full context
+
+```typescript
+public upsert = async (
+  symbol: string,
+  strategyName: string,
+  exchangeName: string,
+  frameName: string,
+  backtest: boolean,
+  payload: IPublicSignalRow,
+  when: Date,
+): Promise<void> => {
+  const filter = { symbol, strategyName, exchangeName, frameName, backtest };
+  const document = await RecentModel.findOneAndUpdate(
+    filter,
+    { $set: { payload, when: when.getTime() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IRecentRow;
+  await this.recentCacheService.setRecentId(result);
+};
+```
+
+---
+
+## State adapter
+
+Stores **arbitrary per-signal state**, namespaced by bucket. A strategy can maintain multiple independent state buckets for a single signal — e.g. one bucket for trailing stop data, another for re-entry cooldown counters.
+
+**Context key:** `(signalId: string, bucketName: string)`  
+**Collection:** `state-items`
+
+### `IPersistStateInstance` implementation
+
+```typescript
+PersistStateAdapter.usePersistStateAdapter(class implements IPersistStateInstance {
+  constructor(
+    readonly signalId: string,
+    readonly bucketName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readStateData(): Promise<StateData | null> {
+    const row = await ioc.stateDbService.findByContext(
+      this.signalId, this.bucketName,
+    );
+    return row ? row.payload : null;
+  }
+
+  async writeStateData(data: StateData, when: Date): Promise<void> {
+    await ioc.stateDbService.upsert(
+      this.signalId, this.bucketName, data, when,
+    );
+  }
+
+  dispose(): void { void 0; }
+});
+```
+
+`readStateData` returns `null` when no bucket document exists yet. The caller must handle the null case, typically by initialising state to a default value on the first read.
+
+### State Mongoose schema
+
+From `src/schema/State.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { StateData } from "backtest-kit";
+
+interface IStateDto {
+  signalId: string;
+  bucketName: string;
+  payload: StateData;
+  when: number;
+}
+
+interface StateDocument extends IStateDto, Document {}
+
+interface IStateRow extends IStateDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const StateSchema: Schema<StateDocument> = new Schema(
+  {
+    signalId:   { type: String, required: true, index: true },
+    bucketName: { type: String, required: true, index: true },
+    payload:    { type: Schema.Types.Mixed, required: true },
+    when:       { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+StateSchema.index({ signalId: 1, bucketName: 1 }, { unique: true });
+
+const StateModel = mongoose.model<StateDocument>("state-items", StateSchema);
+```
+
+### `StateDbService` — upsert with `when`
+
+```typescript
+public upsert = async (
+  signalId: string,
+  bucketName: string,
+  payload: StateData,
+  when: Date,
+): Promise<void> => {
+  const filter = { signalId, bucketName };
+  const document = await StateModel.findOneAndUpdate(
+    filter,
+    { $set: { payload, when: when.getTime() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IStateRow;
+  await this.stateCacheService.setStateId(result);
+};
+
+public findByContext = async (
+  signalId: string,
+  bucketName: string,
+): Promise<IStateRow | null> => {
+  try {
+    const cachedId = await this.stateCacheService.getStateId(signalId, bucketName);
+    if (cachedId) {
+      return await super.findById(cachedId) as IStateRow;
+    }
+  } catch {
+    void 0;
+  }
+  const result = await super.findByFilter({ signalId, bucketName }) as IStateRow | null;
+  if (result) {
+    await this.stateCacheService.setStateId(result);
+  }
+  return result;
+};
+```
+
+---
+
+## Session adapter
+
+Stores **one session document per running strategy** — the strategy-level counterpart to the per-signal State adapter. A session persists across multiple signal lifecycles, making it suitable for data that should outlive any individual trade.
+
+**Context key:** `(strategyName, exchangeName, frameName)`  
+**Collection:** `session-items`
+
+### `IPersistSessionInstance` implementation
+
+```typescript
+PersistSessionAdapter.usePersistSessionAdapter(class implements IPersistSessionInstance {
+  constructor(
+    readonly strategyName: string,
+    readonly exchangeName: string,
+    readonly frameName: string,
+  ) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readSessionData(): Promise<SessionData | null> {
+    const row = await ioc.sessionDbService.findByContext(
+      this.strategyName, this.exchangeName, this.frameName,
+    );
+    return row ? row.payload : null;
+  }
+
+  async writeSessionData(data: SessionData, when: Date): Promise<void> {
+    await ioc.sessionDbService.upsert(
+      this.strategyName, this.exchangeName, this.frameName, data, when,
+    );
+  }
+
+  dispose(): void { void 0; }
+});
+```
+
+### Session Mongoose schema
+
+From `src/schema/Session.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { SessionData } from "backtest-kit";
+
+interface ISessionDto {
+  strategyName: string;
+  exchangeName: string;
+  frameName: string;
+  payload: SessionData;
+  when: number;
+}
+
+interface SessionDocument extends ISessionDto, Document {}
+
+interface ISessionRow extends ISessionDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const SessionSchema: Schema<SessionDocument> = new Schema(
+  {
+    strategyName: { type: String, required: true, index: true },
+    exchangeName: { type: String, required: true, index: true },
+    frameName:    { type: String, required: true, index: true },
+    payload:      { type: Schema.Types.Mixed, required: true },
+    when:         { type: Number, required: true, index: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+SessionSchema.index(
+  { strategyName: 1, exchangeName: 1, frameName: 1 },
+  { unique: true }
+);
+
+const SessionModel = mongoose.model<SessionDocument>("session-items", SessionSchema);
+```
+
+### `SessionDbService` — upsert with full context
+
+```typescript
+public upsert = async (
+  strategyName: string,
+  exchangeName: string,
+  frameName: string,
+  payload: SessionData,
+  when: Date,
+): Promise<void> => {
+  const filter = { strategyName, exchangeName, frameName };
+  const document = await SessionModel.findOneAndUpdate(
+    filter,
+    { $set: { payload, when: when.getTime() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as ISessionRow;
+  await this.sessionCacheService.setSessionId(result);
+};
+
+public findByContext = async (
+  strategyName: string,
+  exchangeName: string,
+  frameName: string,
+): Promise<ISessionRow | null> => {
+  try {
+    const cachedId = await this.sessionCacheService.getSessionId(
+      strategyName, exchangeName, frameName,
+    );
+    if (cachedId) {
+      return await super.findById(cachedId) as ISessionRow;
+    }
+  } catch {
+    void 0;
+  }
+  const result = await super.findByFilter({
+    strategyName, exchangeName, frameName,
+  }) as ISessionRow | null;
+  if (result) {
+    await this.sessionCacheService.setSessionId(result);
+  }
+  return result;
+};
+```

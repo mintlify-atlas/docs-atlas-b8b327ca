@@ -1,0 +1,152 @@
+---
+title: "BaseCRUD: Generic MongoDB CRUD Factory for Mongoose Models"
+sidebarTitle: "BaseCRUD"
+description: "API reference for the BaseCRUD factory class providing create, findById, findByFilter, findAll, iterate, and paginate operations over any Mongoose model."
+---
+
+`BaseCRUD` is a `di-factory` factory class that provides a complete set of generic MongoDB operations for any Mongoose model. All 15 `DbService` classes in the project extend `BaseCRUD`, inheriting its full CRUD surface and supplementing it with domain-specific methods such as `upsert`, `findByContext`, and `listKeys`. By centralising common database logic in a single factory, every service gets consistent logging, error handling, and the `readTransform` normalisation step without duplicating code.
+
+## Implementation
+
+```typescript
+import { factory } from "di-factory";
+import { Model } from "mongoose";
+import { readTransform } from "../../utils/readTransform";
+import { omit } from "lodash";
+import { inject } from "../core/di";
+import LoggerService from "../services/base/LoggerService";
+import TYPES from "../core/types";
+
+const FIND_ALL_LIMIT = 1_000;
+
+export const BaseCRUD = factory(
+  class {
+    readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+    constructor(public readonly TargetModel: Model<any>) {}
+
+    public async create(dto: object) { ... }
+    public async update(id: string, dto: object) { ... }
+    public async findById(id: string) { ... }
+    public async findByFilter(filterData: object, sort?: object) { ... }
+    public async findAll(filterData: object = {}, limit = FIND_ALL_LIMIT) { ... }
+    public async *iterate(filterData: object = {}, sort?: object) { ... }
+    public async paginate(filterData, pagination, sort?) { ... }
+  }
+);
+```
+
+The factory pattern means each `DbService` calls `BaseCRUD(Model)` to produce a class that is already bound to a specific Mongoose model, which is then registered in the IoC container as a singleton.
+
+## The `readTransform` Helper
+
+Every document returned by `BaseCRUD` passes through `readTransform()` before reaching the caller. This utility converts Mongoose's internal `_id` field into a plain string `id` field while keeping all other properties intact:
+
+```typescript
+export const readTransform = <T extends IIncomingRowData>(data: T): T & IOutgoingRowData => ({
+    ...data,
+    id: String(data._id),
+});
+```
+
+This means callers always receive an `id: string` property and never need to interact with `_id` directly.
+
+## Methods
+
+### `create(dto: object): Promise<any>`
+
+Creates a new document in the collection using the provided DTO. Returns the persisted document passed through `readTransform`.
+
+```typescript
+public async create(dto: object) {
+  const item = await this.TargetModel.create(dto);
+  return readTransform(item.toJSON());
+}
+```
+
+### `update(id: string, dto: object): Promise<any>`
+
+Updates the document identified by MongoDB `_id`. Uses `findByIdAndUpdate` with `{ new: true, runValidators: true }` so the returned document reflects the update and schema validators run. The `id` field is stripped from the update payload via `omit(dto, "id")` to prevent accidentally overwriting `_id`. Throws if no document is found.
+
+```typescript
+public async update(id: string, dto: object) {
+  const updatedDocument = await this.TargetModel.findByIdAndUpdate(
+    id,
+    omit(dto, "id"),
+    { new: true, runValidators: true }
+  );
+  if (!updatedDocument) {
+    throw new Error(`${this.TargetModel.modelName} not found`);
+  }
+  return readTransform(updatedDocument.toJSON());
+}
+```
+
+### `findById(id: string): Promise<any>`
+
+Finds a single document by its MongoDB `_id`. Throws `Error("<modelName> not found")` if no document exists with that id.
+
+### `findByFilter(filterData: object, sort?: object): Promise<any | null>`
+
+Finds the first document matching the filter object. Accepts an optional `sort` descriptor (e.g. `{ date: -1 }`). Returns `null` if no document matches — unlike `findById`, this method does **not** throw on a miss.
+
+```typescript
+public async findByFilter(filterData: object, sort?: object) {
+  const item = await this.TargetModel.findOne(filterData, null, { sort });
+  if (item) return readTransform(item.toJSON());
+  return null;
+}
+```
+
+### `findAll(filterData?: object, limit?: number): Promise<any[]>`
+
+Returns all documents matching `filterData`, sorted by `date` descending. The default `limit` is **1,000** documents (`FIND_ALL_LIMIT`). Pass a custom limit as the second argument if you need more or fewer results.
+
+### `iterate(filterData?: object, sort?: object): AsyncGenerator<any>`
+
+An async generator that yields documents one at a time using Mongoose's cursor-based iteration. Suitable for streaming large result sets without buffering the entire collection in memory.
+
+```typescript
+public async *iterate(filterData: object = {}, sort?: object) {
+  for await (const document of this.TargetModel.find(filterData, null, { sort })) {
+    yield readTransform(document.toJSON());
+  }
+}
+```
+
+### `paginate(filterData, pagination: { limit: number; offset: number }, sort?): Promise<{ rows: any[], total: number }>`
+
+Executes a paginated query. Returns an object with:
+- `rows` — the page of transformed documents.
+- `total` — the total count of matching documents (used by UI pagination controls).
+
+`offset` maps to Mongoose's `.skip()` and `limit` to `.limit()`.
+
+## Logging
+
+Every method calls `this.loggerService.info(...)` before executing the database query, logging the model name and key parameters. This provides an audit trail for every database operation without any configuration at the call site.
+
+## Extending BaseCRUD
+
+<Note>
+  Individual `DbService` classes extend `BaseCRUD` and add domain-specific methods. For example, `SignalDbService` adds `upsert(symbol, strategyName, exchangeName, payload)` and `findByContext(symbol, strategyName, exchangeName)`. `MeasureDbService` adds `softRemove(bucket, key)` and `listKeys(bucket)`. The base class handles the generic operations; domain logic lives in the concrete service.
+</Note>
+
+### Example: a DbService extending BaseCRUD
+
+```typescript
+const REDIS_KEY = "signal_cache";
+export class SignalDbService extends BaseCRUD(SignalModel) {
+  async findByContext(symbol: string, strategyName: string, exchangeName: string) {
+    return this.findByFilter({ symbol, strategyName, exchangeName });
+  }
+
+  async upsert(symbol: string, strategyName: string, exchangeName: string, payload: ISignalRow | null) {
+    const existing = await this.findByContext(symbol, strategyName, exchangeName);
+    if (existing) {
+      return this.update(existing.id, { payload });
+    }
+    return this.create({ symbol, strategyName, exchangeName, payload });
+  }
+}
+```

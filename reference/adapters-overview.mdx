@@ -1,0 +1,75 @@
+---
+title: "Persist Adapters: All 15 MongoDB+Redis Implementations"
+sidebarTitle: "Overview"
+description: "Reference overview of all 15 IPersist* adapter implementations that wire backtest-kit to MongoDB for durability and Redis for O(1) context-key caching."
+---
+
+Persist adapters are the bridge between the backtest-kit engine and your storage infrastructure. Each adapter implements a corresponding `IPersist*Instance` interface defined by backtest-kit, and is registered once at startup via a static `usePersist*Adapter` call. When the engine needs to read or write strategy data, it instantiates the adapter class with a set of _context fields_ — the exact combination of constructor arguments that uniquely identifies one logical slot (e.g. one symbol + strategy + exchange). The adapter is then responsible for resolving or persisting that slot to MongoDB, using Redis to cache the MongoDB `_id` so that subsequent reads skip the full filter query and go straight to a fast `findById`.
+
+## Common adapter skeleton
+
+Every adapter in this project follows the same four-part pattern:
+
+```typescript
+PersistXAdapter.usePersistXAdapter(class implements IPersistXInstance {
+  constructor(/* context fields from backtest-kit */) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();  // gate first-touch on Mongo + Redis ready
+  }
+
+  async readXData(...) {
+    return await ioc.xDbService.findByContext(...);
+  }
+
+  async writeXData(..., when: Date) {
+    await ioc.xDbService.upsert(..., when);
+  }
+});
+```
+
+`waitForInfra` is a `singleshot`-wrapped promise that resolves once both MongoDB and Redis have confirmed connectivity. The `initial` guard ensures the infra gate is only awaited on the very first instantiation, not on every subsequent context construction.
+
+## All 15 adapters at a glance
+
+| Adapter | Interface | Collection | Context key | Purpose |
+|---|---|---|---|---|
+| Candle | `IPersistCandleInstance` | `candle-items` | `(symbol, interval, timestamp)` | OHLCV cache; immutable inserts |
+| Signal | `IPersistSignalInstance` | `signal-items` | `(symbol, strategyName, exchangeName)` | Live signal state per context |
+| Schedule | `IPersistScheduleInstance` | `schedule-items` | `(symbol, strategyName, exchangeName)` | Pending scheduled signal |
+| Risk | `IPersistRiskInstance` | `risk-items` | `(riskName, exchangeName)` | Active risk positions snapshot |
+| Partial | `IPersistPartialInstance` | `partial-items` | `(symbol, strategyName, exchangeName, signalId)` | Partial profit/loss levels per signal |
+| Breakeven | `IPersistBreakevenInstance` | `breakeven-items` | `(symbol, strategyName, exchangeName, signalId)` | Breakeven reached flag |
+| Storage | `IPersistStorageInstance` | `storage-items` | `(backtest, signalId)` | Closed/opened signal log per mode |
+| Notification | `IPersistNotificationInstance` | `notification-items` | `(backtest, notificationId)` | Event notifications |
+| Log | `IPersistLogInstance` | `log-items` | `(entryId)` | Strategy log entries |
+| Measure | `IPersistMeasureInstance` | `measure-items` | `(bucket, entryKey)` | LLM/API response cache (soft-delete) |
+| Interval | `IPersistIntervalInstance` | `interval-items` | `(bucket, entryKey)` | Once-per-interval markers (soft-delete) |
+| Memory | `IPersistMemoryInstance` | `memory-items` | `(signalId, bucketName, memoryId)` | Per-signal memory store (soft-delete) |
+| Recent | `IPersistRecentInstance` | `recent-items` | `(symbol, strategyName, exchangeName, frameName, backtest)` | Last public signal per context |
+| State | `IPersistStateInstance` | `state-items` | `(signalId, bucketName)` | Per-signal state buckets |
+| Session | `IPersistSessionInstance` | `session-items` | `(strategyName, exchangeName, frameName)` | One session per running strategy |
+
+## Detailed adapter pages
+
+<CardGroup cols={2}>
+  <Card title="Candle" icon="chart-candlestick" href="/reference/candle-adapter">
+    OHLCV candle persistence with `$setOnInsert` immutability and compound unique index on `(symbol, interval, timestamp)`.
+  </Card>
+  <Card title="Signal & Schedule" icon="signal" href="/reference/signal-adapter">
+    Live signal state and pending scheduled signal per `(symbol, strategyName, exchangeName)` context with Redis caching.
+  </Card>
+  <Card title="Risk / Partial / Breakeven" icon="shield-halved" href="/reference/risk-partial-breakeven">
+    Signal-affecting adapters that store position snapshots, partial P&L levels, and breakeven flags — all with `when: Date` look-ahead bias protection.
+  </Card>
+  <Card title="Storage / Notification / Log" icon="database" href="/reference/storage-notification-log">
+    Audit trail adapters for closed/opened signals, event notifications, and strategy log entries, partitioned by `backtest` mode.
+  </Card>
+  <Card title="Measure / Interval / Memory" icon="clock-rotate-left" href="/reference/measure-interval-memory">
+    Soft-delete adapters for LLM response caching, once-per-interval markers, and per-signal key-value memory storage.
+  </Card>
+  <Card title="Recent / State / Session" icon="layer-group" href="/reference/recent-state-session">
+    Ongoing strategy state: last public signal per context, per-signal state buckets, and one session document per running strategy.
+  </Card>
+</CardGroup>

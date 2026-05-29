@@ -1,0 +1,172 @@
+---
+title: "RedisService: ioredis Connection Management"
+sidebarTitle: "RedisService"
+description: "Reference for the RedisService class that manages the ioredis connection to Redis, including authentication, waitForInit(), and the getRedis() singleton."
+---
+
+`RedisService` is the infrastructure service that owns the ioredis connection lifecycle. Like its Mongoose counterpart, it is a singleton in the IoC container and exposes `waitForInit()` so that all `CacheService` classes can wait for a healthy Redis connection before performing cache operations. The underlying `ioredis` client is managed through the `getRedis()` singleshot factory in `src/config/redis.ts`, which is shared between `RedisService` and `BaseMap`.
+
+## Implementation
+
+### `src/lib/services/base/RedisService.ts`
+
+```typescript
+import { Redis } from "ioredis";
+import {
+  singleshot,
+  sleep,
+} from "functools-kit";
+import { getRedis } from "../../../config/redis";
+import { inject } from "../../core/di";
+import LoggerService from "./LoggerService";
+import TYPES from "../../core/types";
+
+const CONNECTION_TIMEOUT = 15_000;
+const TIMEOUT_SYMBOL = Symbol('timeout');
+
+const waitForConnect = (redis: Redis, self: RedisService) => new Promise<void>((resolve) => {
+  redis.on('ready', () => {
+    self.loggerService.log("redisService ready");
+    resolve();
+  });
+});
+
+export class RedisService {
+
+  readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+  public waitForInit = singleshot(async () => {
+    this.loggerService.log("redisService waitForInit");
+    const redis = await getRedis();
+    if (redis.status === 'ready') {
+      return redis
+    }
+    const result = await Promise.race([
+      waitForConnect(redis, this),
+      sleep(CONNECTION_TIMEOUT).then(() => TIMEOUT_SYMBOL),
+    ])
+    if (result === TIMEOUT_SYMBOL) {
+      this.waitForInit.clear();
+      throw new Error("Redis connection timeout")
+    }
+    return redis;
+  });
+
+  protected init = async () => {
+    this.loggerService.log("redisService init");
+    await this.waitForInit();
+  };
+}
+
+export default RedisService;
+```
+
+### `src/config/redis.ts`
+
+```typescript
+import { singleshot } from "functools-kit";
+import { Redis } from "ioredis";
+import {
+  CC_REDIS_HOST,
+  CC_REDIS_PASSWORD,
+  CC_REDIS_PORT,
+  CC_REDIS_USER,
+} from "./params";
+
+export const getRedis = singleshot(() => {
+  const redis = new Redis({
+    host: CC_REDIS_HOST,
+    port: CC_REDIS_PORT,
+    username: CC_REDIS_USER,
+    password: CC_REDIS_PASSWORD,
+  });
+
+  setInterval(async () => {
+    await redis.ping();
+  }, 30000);
+
+  process.on("SIGINT", async () => {
+    await redis.disconnect(false);
+  });
+
+  return redis;
+});
+```
+
+## Constructor
+
+`RedisService` takes no constructor arguments. It is instantiated by the IoC container and receives `loggerService` via property injection:
+
+```typescript
+readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+```
+
+Access the service through `ioc.redisService`; never construct it directly.
+
+## Methods
+
+### `waitForInit(): Promise<void>`
+
+Establishes the ioredis connection to Redis. Safe to call multiple times — the `singleshot` wrapper ensures the handshake occurs exactly once and all concurrent callers await the same promise.
+
+The method checks `redis.status === 'ready'` immediately; if Redis is already connected it returns right away. Otherwise it races the `ready` event against a **15-second timeout**. On timeout it clears the singleshot gate (so a future call can retry) and throws `Error("Redis connection timeout")`.
+
+### `getRedis(): Promise<Redis>` _(config-level singleton)_
+
+`getRedis` is exported from `src/config/redis.ts` and is the function `BaseMap` calls to retrieve the shared ioredis client. It is a `singleshot` factory — the `Redis` instance is constructed once and returned to every caller thereafter.
+
+The factory also installs:
+- A **30-second keepalive `PING`** interval to prevent idle connection timeouts.
+- A **`SIGINT` handler** that calls `redis.disconnect(false)` for a clean shutdown without flushing pending commands.
+
+## Configuration
+
+The ioredis client is constructed from four environment variables defined in `src/config/params.ts`:
+
+```typescript
+new Redis({
+  host: CC_REDIS_HOST,
+  port: CC_REDIS_PORT,
+  username: CC_REDIS_USER,
+  password: CC_REDIS_PASSWORD,
+})
+```
+
+| Variable | Type | Default |
+|---|---|---|
+| `CC_REDIS_HOST` | `string` | `127.0.0.1` |
+| `CC_REDIS_PORT` | `number` | `6379` |
+| `CC_REDIS_USER` | `string` | `default` |
+| `CC_REDIS_PASSWORD` | `string` | `mysecurepassword` |
+
+<Tip>
+  The default Redis container ships with the password `mysecurepassword`. This is intentionally simple for local development but **must be changed in production**. Set a strong password via the `CC_REDIS_PASSWORD` environment variable and update the corresponding `requirepass` directive in your Redis configuration or Docker Compose `command` override.
+</Tip>
+
+## Connection Lifecycle
+
+| Stage | Description |
+|---|---|
+| First `waitForInit()` call | `getRedis()` constructs the `Redis` instance; ioredis begins connecting |
+| `redis.status === 'ready'` | Already connected — resolves immediately |
+| `ready` event fires | Connection confirmed — promise resolves |
+| 15 s timeout reached | `waitForInit.clear()` resets; throws `"Redis connection timeout"` |
+| `SIGINT` | `redis.disconnect(false)` closes gracefully |
+| Every 30 s | `redis.ping()` keepalive fired to prevent idle disconnects |
+
+## Integration with `waitForInfra()`
+
+`RedisService.waitForInit()` is always called alongside `MongoService.waitForInit()` in the shared `waitForInfra()` singleshot defined in `src/config/setup.ts`:
+
+```typescript
+const waitForInfra = singleshot(
+  async () => {
+    await Promise.all([
+      ioc.mongoService.waitForInit(),
+      ioc.redisService.waitForInit(),
+    ]);
+  }
+);
+```
+
+All 15 persist adapters gate on `waitForInfra()` so that both infrastructure layers are ready before any data operation begins.

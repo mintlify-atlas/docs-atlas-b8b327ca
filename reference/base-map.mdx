@@ -1,0 +1,164 @@
+---
+title: "BaseMap: Redis Key-Value Store Factory for Cache Services"
+sidebarTitle: "BaseMap"
+description: "API reference for the BaseMap factory class that provides get, set, delete, has, keys, values, toArray, iterate, size, and clear operations over namespaced Redis keys."
+---
+
+`BaseMap` is the `di-factory` factory that all 15 `CacheService` classes extend. It wraps the shared ioredis client with a string-keyed map API, adds namespace isolation so each service's keys cannot collide with another service's, and supports an optional TTL that is applied automatically on every `set` call. Bulk operations (`toArray`, `iterate`, `keys`, `values`, `size`, `clear`) use Redis `SCAN` with a batch size of 100 to avoid blocking the Redis event loop on large keyspaces.
+
+## Implementation
+
+```typescript
+import { factory } from "di-factory";
+import { getRedis } from "../../config/redis";
+import { inject } from "../core/di";
+import LoggerService from "../services/base/LoggerService";
+import TYPES from "../core/types";
+
+const ITERATOR_BATCH_SIZE = 100;
+const DEFAULT_TTL_EXPIRE_SECONDS = 5 * 60; // 5 minutes
+
+export const BaseMap = factory(
+  class BaseMap {
+    readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+    constructor(
+      readonly connectionKey: string,
+      readonly ttlExpireSeconds: number = DEFAULT_TTL_EXPIRE_SECONDS
+    ) {}
+
+    _getItemKey(key: string): string {
+      return `${this.connectionKey}:${key}`;
+    }
+
+    // ... method implementations
+  }
+);
+
+export type TBaseMap = InstanceType<ReturnType<typeof BaseMap>>;
+export default BaseMap;
+```
+
+## Namespace Isolation
+
+Every key stored in Redis is prefixed with the service's `connectionKey`:
+
+```
+${connectionKey}:${key}
+```
+
+For example, a `SignalCacheService` with `connectionKey = "signal_cache"` stores the key `"abc123"` as `signal_cache:abc123`. Bulk operations use the glob pattern `${connectionKey}:*` to scope all SCAN commands to that service's namespace exclusively.
+
+## Factory Pattern and TTL
+
+`CacheService` classes call `BaseMap(connectionKey, ttlExpireSeconds)` to produce a namespaced class:
+
+```typescript
+const REDIS_KEY = "signal_cache";
+export class SignalCacheService extends BaseMap(REDIS_KEY, -1) {
+  // -1 = no TTL expiration
+}
+```
+
+| `ttlExpireSeconds` | Behaviour |
+|---|---|
+| `-1` | TTL disabled — keys persist until explicitly deleted or `clear()` is called |
+| `> 0` | Every `set()` call applies `EXPIRE` with this value in seconds |
+| _(default)_ | 300 seconds (5 minutes) |
+
+## Methods
+
+### `set(key: string, value: unknown): Promise<void>`
+
+Stores `value` under the namespaced key. Throws if `key` is an empty string. If `ttlExpireSeconds !== -1`, immediately applies `EXPIRE` on the stored key after the `SET` command.
+
+```typescript
+async set(key: string, value: unknown): Promise<void> {
+  const redis = await getRedis();
+  const itemKey = this._getItemKey(key);
+  await redis.set(itemKey, value as string);
+  if (this.ttlExpireSeconds !== -1) {
+    await redis.expire(itemKey, this.ttlExpireSeconds);
+  }
+}
+```
+
+### `get(key: string | null): Promise<unknown | null>`
+
+Retrieves the value stored under `key`. Returns `null` if the key does not exist **or** if `null` is passed as the key (short-circuit guard to simplify call sites that may hold a nullable key).
+
+### `delete(key: string): Promise<void>`
+
+Deletes the key from Redis using `DEL`. A `null` key is silently ignored.
+
+### `has(key: string): Promise<boolean>`
+
+Returns `true` if the key exists in Redis (`EXISTS` returns `1`). A `null` key always returns `false`.
+
+### `clear(): Promise<void>`
+
+Deletes **all keys** belonging to this service's namespace by iterating with `SCAN` and calling `DEL` on each batch:
+
+```typescript
+async clear(): Promise<void> {
+  const redis = await getRedis();
+  let cursor: string | number = 0;
+  const pattern = `${this.connectionKey}:*`;
+  while (true) {
+    const [nextCursor, keys] = await redis.scan(cursor, "MATCH", pattern, "COUNT", ITERATOR_BATCH_SIZE);
+    cursor = nextCursor;
+    if (keys?.length) {
+      await redis.del(...keys);
+    }
+    if (cursor === "0" || cursor === 0) break;
+  }
+}
+```
+
+### `toArray(): Promise<[string, unknown][]>`
+
+Returns all key-value pairs in the namespace as an array of `[key, value]` tuples. Keys are returned without the namespace prefix (i.e., the raw application key). Uses `SCAN` + `MGET` for batch-efficient retrieval.
+
+### `iterate(): AsyncIterableIterator<readonly [string, unknown]>`
+
+An async iterator over all `[key, value]` pairs in the namespace. Yields results batch by batch as `SCAN` pages through the keyspace, making it suitable for large datasets without accumulating all results in memory.
+
+```typescript
+async *iterate(): AsyncIterableIterator<readonly [string, unknown]> {
+  // Uses SCAN with ITERATOR_BATCH_SIZE = 100
+  // Yields [strippedKey, value] for each entry
+}
+```
+
+### `keys(): AsyncIterableIterator<string>`
+
+An async iterator that yields only the keys (without the namespace prefix), one per iteration step.
+
+### `values(): AsyncIterableIterator<unknown>`
+
+An async iterator that yields only the values stored in the namespace.
+
+### `size(): Promise<number>`
+
+Returns the total count of keys in the namespace by summing `SCAN` batch lengths. Does not load any values into memory.
+
+## SCAN Batching
+
+All bulk operations (`clear`, `toArray`, `iterate`, `keys`, `values`, `size`) share the same `SCAN`-based loop pattern:
+
+```typescript
+let cursor: string | number = 0;
+const pattern = `${this.connectionKey}:*`;
+while (true) {
+  const [nextCursor, keys] = await redis.scan(cursor, "MATCH", pattern, "COUNT", ITERATOR_BATCH_SIZE);
+  cursor = nextCursor;
+  // process keys batch...
+  if (cursor === "0" || cursor === 0) break;
+}
+```
+
+`ITERATOR_BATCH_SIZE = 100` is a hint to Redis about the approximate number of keys to return per `SCAN` call. This keeps each iteration step short and non-blocking, which is critical in single-threaded Redis deployments where a large `KEYS *` call would block all other clients.
+
+## Logging
+
+Every method emits an `info`-level log via `loggerService` before executing the Redis command. The log includes the operation name and the key (where applicable), providing a trace of all cache activity.

@@ -1,0 +1,148 @@
+---
+title: "Atomic Upserts: Eliminating E11000 Race Conditions in MongoDB"
+sidebarTitle: "Atomicity"
+description: "How backtest-kit-redis-mongo-docker uses findOneAndUpdate with compound unique indexes to guarantee write durability and read-after-write consistency."
+---
+
+Every persist adapter in `backtest-kit-redis-mongo-docker` upholds a strict write durability contract: once `writeXData()` returns without throwing, the very next `readXData()` call — whether it hits Redis or MongoDB — must observe the value that was just written. Fulfilling this contract in a concurrent environment (multiple strategy workers, paper trading alongside a backtest) requires the database layer to be atomically correct, not just eventually consistent.
+
+## The Naïve Approach Fails Under Concurrency
+
+A common first attempt at MongoDB persistence looks like this:
+
+```typescript
+// ❌ UNSAFE — race condition
+const existing = await Model.findOne(filter);
+if (!existing) {
+  await Model.create({ ...filter, payload });   // Two writers can both reach here.
+} else {
+  await Model.updateOne(filter, { $set: { payload } });
+}
+```
+
+When two processes both evaluate `findOne` before either has written, both see "no existing document" and both attempt `create`. The second insert crashes with **E11000 Duplicate Key Error** because the compound unique index rejects the conflicting document. Worse, without a retry loop the write is silently lost.
+
+## The Atomic Upsert Pattern
+
+All `XDbService` classes replace the two-step check-then-act with a single `findOneAndUpdate` call. For `SignalDbService`:
+
+```typescript
+// src/lib/services/db/SignalDbService.ts
+public upsert = async (
+  symbol: string,
+  strategyName: string,
+  exchangeName: string,
+  payload: ISignalRow | null,
+): Promise<void> => {
+  const filter = { symbol, strategyName, exchangeName };
+  const document = await SignalModel.findOneAndUpdate(
+    filter,
+    { $set: { payload } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as ISignalRowDoc;
+  await this.signalCacheService.setSignalId(result);
+};
+```
+
+MongoDB's server-side `findOneAndUpdate` with `upsert: true` is **atomic at the document level**: the find and the write are a single operation inside the storage engine. No two callers can both observe "missing" and both insert — only one succeeds; the other silently updates the same document.
+
+## Four Key Properties
+
+Every upsert in the codebase relies on the same four guarantees:
+
+**1. Filter shape matches the compound unique index**
+
+The `filter` passed to `findOneAndUpdate` always uses exactly the fields that form the schema's unique compound index. For `SignalModel`:
+
+```typescript
+// Signal.schema.ts
+SignalSchema.index(
+  { symbol: 1, strategyName: 1, exchangeName: 1 },
+  { unique: true }
+);
+
+// SignalDbService — filter mirrors the index exactly
+const filter = { symbol, strategyName, exchangeName };
+```
+
+MongoDB can therefore guarantee that at most one document matches the filter, making the upsert deterministic.
+
+**2. `$set` for mutable fields**
+
+Using `$set` (rather than a full replacement) means concurrent writers that race to the same document will converge on the latest value rather than trampling each other's writes. The `payload` field — the actual strategy data — is always written via `$set`.
+
+**3. `new: true` returns the mutated document for immediate cache update**
+
+The `new: true` option makes MongoDB return the *post-update* state of the document. The service uses this return value directly to update the Redis cache in the same synchronous critical section:
+
+```typescript
+const document = await SignalModel.findOneAndUpdate(
+  filter,
+  { $set: { payload } },
+  { upsert: true, new: true, setDefaultsOnInsert: true },  // ← new: true
+);
+await this.signalCacheService.setSignalId(result);  // cache updated immediately
+```
+
+Because `new: true` is set, the Redis entry always reflects the document that MongoDB just committed — never a stale pre-update snapshot.
+
+**4. `setDefaultsOnInsert: true` applies Mongoose schema defaults**
+
+On the first insert (upsert path) Mongoose schema defaults would normally be skipped if only `$set` and `$unset` operators are provided. `setDefaultsOnInsert: true` re-enables them, so fields like `positions: []` on `RiskSchema` are populated correctly for newly created documents.
+
+## Soft-Delete Pattern
+
+Adapters that support logical deletion — Interval, Memory, and Measure — use a `softRemove` method that sets `removed: true` without physically deleting the MongoDB document. This preserves audit history and allows the Redis cache entry to reflect the deletion:
+
+```typescript
+// src/lib/services/db/IntervalDbService.ts
+public softRemove = async (bucket: string, entryKey: string): Promise<void> => {
+  const filter = { bucket, entryKey };
+  const document = await IntervalModel.findOneAndUpdate(
+    filter,
+    { $set: { removed: true, "payload.removed": true } },
+    { new: true },
+  );
+  if (!document) {
+    return;
+  }
+  const result = readTransform(document.toJSON()) as unknown as IIntervalRow;
+  await this.intervalCacheService.setIntervalId(result);
+};
+```
+
+The same pattern is used in `MemoryDbService.softRemove` and `MeasureDbService.softRemove`. Read methods check `row.removed` and return `null` for soft-deleted entries, which backtest-kit treats the same as a missing record.
+
+<Note>
+**Candle immutability — `$setOnInsert` instead of `$set`**
+
+`CandleDbService` is the one exception to the `$set` rule. OHLCV candle data is immutable: once a candle for a given `(symbol, interval, timestamp)` tuple is written, it must never change. `CandleDbService.create` therefore uses `$setOnInsert`, which writes the OHLCV fields **only** when inserting a brand-new document and is a no-op on subsequent upserts:
+
+```typescript
+const document = await CandleModel.findOneAndUpdate(
+  { symbol, interval, timestamp },         // unique index fields
+  { $setOnInsert: insertOnly },            // OHLCV written once, never overwritten
+  { upsert: true, new: true, setDefaultsOnInsert: true },
+);
+```
+
+This guarantees that a second ingest run for the same data range cannot corrupt historical prices.
+</Note>
+
+<Tip>
+**Infrastructure readiness guard — `waitForInfra()`**
+
+All adapter `waitForInit(initial)` methods gate on a `singleshot` promise that awaits both `mongoService.waitForInit()` and `redisService.waitForInit()` before any upsert or read is attempted:
+
+```typescript
+const waitForInfra = singleshot(async () => {
+  await Promise.all([
+    ioc.mongoService.waitForInit(),
+    ioc.redisService.waitForInit(),
+  ]);
+});
+```
+
+The `singleshot` wrapper from `functools-kit` ensures the Promise is created exactly once and shared across all concurrent callers, so infrastructure is initialized in parallel but never more than once — regardless of how many adapter instances are constructed.
+</Tip>

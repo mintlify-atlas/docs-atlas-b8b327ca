@@ -1,0 +1,290 @@
+---
+title: "Storage, Notification, and Log Persist Adapters"
+sidebarTitle: "Storage / Notification / Log"
+description: "Reference for PersistStorageAdapter, PersistNotificationAdapter, and PersistLogAdapter that maintain signal history, event notifications, and strategy log entries."
+---
+
+Storage, Notification, and Log are the three **audit trail adapters**. Rather than influencing ongoing position management, they record what has already happened — closed and opened signals, fired notifications, and timestamped log lines. These adapters are append-oriented: writes upsert by a unique ID so that re-sending an already-persisted record is idempotent.
+
+<Note>
+Storage and Notification are partitioned by the `backtest: boolean` constructor field. Documents written during a backtest run are stored separately from paper/live documents, so historical simulations never pollute — or read from — real trading data.
+</Note>
+
+---
+
+## Storage adapter
+
+Stores every signal that has been opened or closed, indexed by its `signalId`. The full signal payload is persisted, making it possible to reconstruct the complete trade history for a given mode.
+
+**Context key:** `(backtest: boolean, signalId: string)`  
+**Collection:** `storage-items`
+
+### `IPersistStorageInstance` implementation
+
+```typescript
+PersistStorageAdapter.usePersistStorageAdapter(class implements IPersistStorageInstance {
+  constructor(readonly backtest: boolean) {}
+
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readStorageData(): Promise<StorageData> {
+    const rows = await ioc.storageDbService.listByMode(this.backtest);
+    return rows.map((row) => row.payload);
+  }
+
+  async writeStorageData(signals: StorageData): Promise<void> {
+    for (const signal of signals) {
+      await ioc.storageDbService.upsert(this.backtest, signal.id, signal);
+    }
+  }
+});
+```
+
+`readStorageData` calls `listByMode(backtest)` which returns all documents for the given mode — `findAll({ backtest })` under the hood.
+
+### Storage Mongoose schema
+
+From `src/schema/Storage.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { IStorageSignalRow } from "backtest-kit";
+
+interface IStorageDto {
+  backtest: boolean;
+  signalId: string;
+  payload: IStorageSignalRow;
+}
+
+interface StorageDocument extends IStorageDto, Document {}
+
+interface IStorageRow extends IStorageDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const StorageSchema: Schema<StorageDocument> = new Schema(
+  {
+    backtest:  { type: Boolean, required: true, index: true },
+    signalId:  { type: String, required: true, index: true },
+    payload:   { type: Schema.Types.Mixed, required: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+StorageSchema.index({ backtest: 1, signalId: 1 }, { unique: true });
+
+const StorageModel = mongoose.model<StorageDocument>("storage-items", StorageSchema);
+```
+
+### `StorageDbService` — upsert and list by mode
+
+```typescript
+public upsert = async (
+  backtest: boolean,
+  signalId: string,
+  payload: IStorageSignalRow,
+): Promise<void> => {
+  const filter = { backtest, signalId };
+  const document = await StorageModel.findOneAndUpdate(
+    filter,
+    { $set: { payload } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as IStorageRow;
+  await this.storageCacheService.setStorageId(result);
+};
+
+public listByMode = async (backtest: boolean): Promise<IStorageRow[]> => {
+  return await super.findAll({ backtest }) as IStorageRow[];
+};
+```
+
+There is no `when` column — storage records represent the authoritative final state of a signal and are not subject to look-ahead filtering.
+
+---
+
+## Notification adapter
+
+Stores event notifications raised by strategies. Notifications are returned in reverse chronological order (newest first), and the service caps the list at 200 entries per read.
+
+**Context key:** `(backtest: boolean, notificationId: string)`  
+**Collection:** `notification-items`
+
+### `IPersistNotificationInstance` implementation
+
+```typescript
+PersistNotificationAdapter.usePersistNotificationAdapter(
+  class implements IPersistNotificationInstance {
+    constructor(readonly backtest: boolean) {}
+
+    async waitForInit(initial: boolean) {
+      if (!initial) return;
+      await waitForInfra();
+    }
+
+    async readNotificationData(): Promise<NotificationData> {
+      const rows = await ioc.notificationDbService.listByMode(this.backtest);
+      return rows.map((row) => row.payload).reverse();
+    }
+
+    async writeNotificationData(notifications: NotificationData): Promise<void> {
+      for (const notification of notifications) {
+        await ioc.notificationDbService.upsert(
+          this.backtest, notification.id, notification,
+        );
+      }
+    }
+  }
+);
+```
+
+`listByMode` already sorts by `createDate` descending; `readNotificationData` then reverses the result so the caller receives oldest-first order, matching the in-memory list layout expected by backtest-kit.
+
+### Notification Mongoose schema
+
+From `src/schema/Notification.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { NotificationModel as NotificationPayload } from "backtest-kit";
+
+interface INotificationDto {
+  backtest: boolean;
+  notificationId: string;
+  payload: NotificationPayload;
+}
+
+interface NotificationDocument extends INotificationDto, Document {}
+
+interface INotificationRow extends INotificationDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const NotificationSchema: Schema<NotificationDocument> = new Schema(
+  {
+    backtest:       { type: Boolean, required: true, index: true },
+    notificationId: { type: String, required: true, index: true },
+    payload:        { type: Schema.Types.Mixed, required: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+NotificationSchema.index({ backtest: 1, notificationId: 1 }, { unique: true });
+
+const NotificationModel = mongoose.model<NotificationDocument>(
+  "notification-items", NotificationSchema,
+);
+```
+
+### `NotificationDbService` — list with sort and limit
+
+```typescript
+const LIST_LIMIT = 200;
+
+public listByMode = async (backtest: boolean): Promise<INotificationRow[]> => {
+  const documents = await NotificationModel.find({ backtest })
+    .sort({ createDate: -1 })
+    .limit(LIST_LIMIT);
+  return documents.map((doc) => readTransform(doc.toJSON())) as unknown as INotificationRow[];
+};
+```
+
+The 200-document limit prevents unbounded memory growth during long backtest runs with frequent notifications.
+
+---
+
+## Log adapter
+
+Stores free-form strategy log entries. Unlike Storage and Notification, the Log adapter has no `backtest` partition — all runs share the same `log-items` collection. Entries are returned newest-first, also capped at 200.
+
+**Context key:** `(entryId: string)` — effectively a global singleton per run  
+**Collection:** `log-items`
+
+### `IPersistLogInstance` implementation
+
+```typescript
+PersistLogAdapter.usePersistLogAdapter(class implements IPersistLogInstance {
+  async waitForInit(initial: boolean) {
+    if (!initial) return;
+    await waitForInfra();
+  }
+
+  async readLogData(): Promise<LogData> {
+    const rows = await ioc.logDbService.listAll();
+    return rows.map((row) => row.payload).reverse();
+  }
+
+  async writeLogData(entries: LogData): Promise<void> {
+    for (const entry of entries) {
+      await ioc.logDbService.upsert(entry.id, entry);
+    }
+  }
+});
+```
+
+The Log adapter has no constructor arguments — there is no constructor at all. It is a true singleton adapter.
+
+### Log Mongoose schema
+
+From `src/schema/Log.schema.ts`:
+
+```typescript
+import mongoose, { Document, Schema } from "mongoose";
+import { ILogEntry } from "backtest-kit";
+
+interface ILogDto {
+  entryId: string;
+  payload: ILogEntry;
+}
+
+interface LogDocument extends ILogDto, Document {}
+
+interface ILogRow extends ILogDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+
+const LogSchema: Schema<LogDocument> = new Schema(
+  {
+    entryId: { type: String, required: true, unique: true, index: true },
+    payload: { type: Schema.Types.Mixed, required: true },
+  },
+  { timestamps: { createdAt: "createDate", updatedAt: "updatedDate" }, minimize: false }
+);
+
+const LogModel = mongoose.model<LogDocument>("log-items", LogSchema);
+```
+
+`entryId` has `unique: true` declared directly on the field definition (in addition to the default index), rather than via a separate compound index call, because the context key is a single scalar.
+
+### `LogDbService` — upsert by entryId and list all
+
+```typescript
+const LIST_LIMIT = 200;
+
+public upsert = async (entryId: string, payload: ILogEntry): Promise<void> => {
+  const filter = { entryId };
+  const document = await LogModel.findOneAndUpdate(
+    filter,
+    { $set: { payload } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+  const result = readTransform(document.toJSON()) as unknown as ILogRow;
+  await this.logCacheService.setLogId(result);
+};
+
+public listAll = async (): Promise<ILogRow[]> => {
+  const documents = await LogModel.find({})
+    .sort({ createDate: -1 })
+    .limit(LIST_LIMIT);
+  return documents.map((doc) => readTransform(doc.toJSON())) as unknown as ILogRow[];
+};
+```

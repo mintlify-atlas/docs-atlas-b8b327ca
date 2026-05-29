@@ -1,47 +1,136 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with backtest-kit Redis+MongoDB Docker"
+sidebarTitle: "Quickstart"
+description: "Spin up MongoDB and Redis with docker-compose and run your first backtest-kit backtest in under five minutes using the MongoDB+Redis persistence layer."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide walks you through cloning the repository, configuring your environment, starting the MongoDB and Redis containers, and running your first backtest against the production persistence layer — all in under five minutes. By the end you will have a live web UI at `http://localhost:60050` showing signals, logs, and performance metrics written atomically to MongoDB and cached in Redis.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Clone and install">
+    Clone the repository and install dependencies:
 
     ```bash
-    npm install your-package
+    git clone https://github.com/tripolskypetr/backtest-kit.git
+    cd backtest-kit/backtest-kit-redis-mongo-docker
+    npm install
     ```
+
+    The project uses [Rollup](https://rollupjs.org) to compile your strategy bundle and [`@backtest-kit/cli`](https://www.npmjs.com/package/@backtest-kit/cli) as the runtime entrypoint — both are installed automatically.
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Configure environment">
+    Copy the example environment file and review the two variables it sets:
 
     ```bash
-    your-cli init
+    cp .env.example .env
     ```
+
+    Contents of `.env.example`:
+
+    ```env
+    CC_REDIS_HOST=host.docker.internal
+    CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-kit?wtimeoutMS=15000
+    ```
+
+    | Variable | Purpose |
+    |---|---|
+    | `CC_REDIS_HOST` | Hostname of the Redis server. `host.docker.internal` resolves to the Docker host, allowing a containerised strategy to reach Redis running on the host machine. |
+    | `CC_MONGO_CONNECTION_STRING` | Full MongoDB connection string including the database name and a write-timeout. The `wtimeoutMS=15000` guard prevents indefinite hangs on slow writes. |
+
+    If you are running Node directly on the host (not inside Docker), you can omit the `.env` file entirely — `src/config/params.ts` applies the following defaults:
+
+    | Variable | Default |
+    |---|---|
+    | `CC_REDIS_HOST` | `127.0.0.1` |
+    | `CC_REDIS_PORT` | `6379` |
+    | `CC_REDIS_USER` | `default` |
+    | `CC_REDIS_PASSWORD` | `mysecurepassword` |
+    | `CC_MONGO_CONNECTION_STRING` | `mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000` |
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Start infrastructure">
+    Start MongoDB and Redis as background containers:
 
     ```bash
-    your-cli start
+    docker-compose -f docker/mongodb/docker-compose.yaml up -d
+    docker-compose -f docker/redis/docker-compose.yaml up -d
+    ```
+
+    This brings up:
+
+    - **MongoDB 8.0.4** on port `27017` — data persisted to `docker/mongodb/mongo_data/`
+    - **Redis 7.4.1** on port `6379` — password `mysecurepassword`, data persisted to `docker/redis/redis_data/`
+
+    Both services are configured with `restart: always`, so they survive host reboots automatically. Verify they are running with `docker ps` before proceeding.
+  </Step>
+
+  <Step title="Run a backtest">
+    Build the strategy bundle and launch the backtest runner:
+
+    ```bash
+    npm run start -- --entry --backtest --ui ./build/index.cjs
+    ```
+
+    Flag reference:
+
+    | Flag | Effect |
+    |---|---|
+    | `--entry` | Activates the runner. Without this flag the process exits immediately (safety guard). |
+    | `--backtest` | Selects backtest mode — historical candle data is used. |
+    | `--ui` | Enables the web interface on port `60050`. |
+    | `./build/index.cjs` | Path to the compiled strategy bundle produced by `npm run build`. |
+
+    To run in paper or live mode instead, replace `--backtest` with `--paper` or `--live`:
+
+    ```bash
+    # Paper mode
+    npm run start -- --entry --paper --ui ./build/index.cjs
+
+    # Live mode
+    npm run start -- --entry --live --ui ./build/index.cjs
     ```
   </Step>
+
+  <Step title="Open the web UI">
+    Once the runner has initialised, open the dashboard in your browser:
+
+    ```
+    http://localhost:60050
+    ```
+
+    The web UI (served by `@backtest-kit/ui`) provides real-time views of signals, strategy logs, and performance metrics — all sourced from the MongoDB + Redis persistence layer you just configured. The healthcheck endpoint at `/api/v1/health/health_check` can be polled by external monitors to confirm the process is live.
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Full Docker Deploy
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+For a fully containerised setup — strategy, runner, and the `@backtest-kit/cli` container bundled together — use the root `docker-compose.yaml`. It reads `MODE`, `ENTRY`, `UI`, and `STRATEGY_FILE` from environment variables and uses `extra_hosts: host.docker.internal:host-gateway` so the container can reach MongoDB and Redis on the host.
+
+<CodeGroup>
+
+```bash npm scripts
+# Start (builds the strategy bundle first, then launches the stack)
+npm run start:docker
+
+# Stop
+npm run stop:docker
+```
+
+```bash docker-compose directly
+MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+```
+
+</CodeGroup>
+
+The `MODE` variable accepts `backtest`, `paper`, or `live`. `ENTRY=1` and `UI=1` correspond to the `--entry` and `--ui` CLI flags respectively. `STRATEGY_FILE` points to the compiled bundle — the default is `./build/index.cjs`.
+
+<Tip>
+  Use `docker-compose logs -f` to follow live output from all containers in the stack. For a single service, add the service name — for example `docker-compose logs -f redis` — to isolate Redis logs during connection troubleshooting.
 </Tip>
+
+<Note>
+  This quickstart uses default credentials and a single-node setup suitable for local development. See the [Architecture Overview](/architecture) page for a deep dive into atomicity guarantees and the Redis O(1) cache pattern, and the [Deployment](/deployment) page for production configuration including custom credentials, replica sets, and Redis Sentinel.
+</Note>

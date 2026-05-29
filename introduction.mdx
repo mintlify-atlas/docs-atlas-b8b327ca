@@ -1,0 +1,65 @@
+---
+title: "backtest-kit Redis+MongoDB Docker: Production Persistence Layer"
+sidebarTitle: "Introduction"
+description: "Learn how backtest-kit-redis-mongo-docker replaces file-based storage with MongoDB and Redis to deliver atomic writes and O(1) reads for trading backtests."
+---
+
+`backtest-kit-redis-mongo-docker` is a production-grade integration that replaces backtest-kit's default file-based `./dump/` persistence with a dual-layer store: **MongoDB** as the authoritative source of truth and **Redis** as a sub-millisecond O(1) lookup cache. The project is packaged with `docker-compose` for one-command infrastructure deploys, making it straightforward to move from local experimentation to a fully containerized trading environment without touching a single line of strategy logic.
+
+The core of the integration is **15 custom `IPersist*` adapters** that implement the complete backtest-kit `IPersist*Instance` persistence contract on top of MongoDB and Redis. Each adapter translates a backtest-kit read/write call into an atomic MongoDB `findOneAndUpdate` upsert — eliminating the duplicate-key race conditions that arise with naïve find-then-insert patterns — and immediately backfills the Redis cache so the very next read is O(1). Because the adapters slot into backtest-kit's existing dependency-injection registration points, strategy code, runners, and the CLI entrypoint remain entirely unchanged; only the persistence layer is swapped.
+
+## Persistence Layers
+
+<CardGroup cols={2}>
+  <Card title="MongoDB — Source of Truth" icon="database">
+    All adapter state is durably written to MongoDB using atomic `findOneAndUpdate` upserts with compound unique indexes. Supports backtest, paper, and live modes. Includes `when: Date` timestamps for look-ahead bias protection on signal-affecting adapters.
+  </Card>
+  <Card title="Redis — O(1) Cache" icon="bolt">
+    Each domain has a `*CacheService` that maps a composite context key to a MongoDB document `_id` in Redis. Steady-state reads require only one Redis `GET` plus one MongoDB `findById` — both O(1). Cache misses fall back to a full MongoDB filter query and backfill Redis automatically.
+  </Card>
+</CardGroup>
+
+## The 15 Persist Adapters
+
+Every adapter is registered in `src/config/setup.ts` and shares the same `waitForInit → readXData → writeXData` skeleton. The table below lists each adapter, the MongoDB collection it writes to, its unique compound index (context key), and its purpose.
+
+| Adapter | Collection | Context key | Purpose |
+|---|---|---|---|
+| **Candle** | `candle-items` | `(symbol, interval, timestamp)` | OHLCV cache; immutable inserts |
+| **Signal** | `signal-items` | `(symbol, strategyName, exchangeName)` | Live signal state per context |
+| **Schedule** | `schedule-items` | `(symbol, strategyName, exchangeName)` | Pending scheduled signal |
+| **Risk** | `risk-items` | `(riskName, exchangeName)` | Active risk positions snapshot |
+| **Partial** | `partial-items` | `(symbol, strategyName, exchangeName, signalId)` | Partial profit/loss levels per signal |
+| **Breakeven** | `breakeven-items` | `(symbol, strategyName, exchangeName, signalId)` | Breakeven reached flag |
+| **Storage** | `storage-items` | `(backtest, signalId)` | Closed/opened signal log per mode |
+| **Notification** | `notification-items` | `(backtest, notificationId)` | Event notifications |
+| **Log** | `log-items` | `(entryId)` | Strategy log entries |
+| **Measure** | `measure-items` | `(bucket, entryKey)` | LLM/API response cache (soft-delete) |
+| **Interval** | `interval-items` | `(bucket, entryKey)` | Once-per-interval markers (soft-delete) |
+| **Memory** | `memory-items` | `(signalId, bucketName, memoryId)` | Per-signal memory store (soft-delete) |
+| **Recent** | `recent-items` | `(symbol, strategyName, exchangeName, frameName, backtest)` | Last public signal per context |
+| **State** | `state-items` | `(signalId, bucketName)` | Per-signal state buckets |
+| **Session** | `session-items` | `(strategyName, exchangeName, frameName)` | One session per running strategy |
+
+## Running Modes
+
+backtest-kit supports three modes, all available through the same CLI entrypoint and docker-compose setup:
+
+- **Backtest** — Runs the strategy against historical candle data fetched from an exchange. All adapter state is persisted to MongoDB so results are reproducible across runs without re-fetching candles.
+- **Paper** — Connects to live market data but executes no real orders. Useful for validating a strategy's signal quality and risk behaviour in real time before going live.
+- **Live** — Full live trading mode. The persistence layer behaves identically across all three modes; the difference is in how the backtest-kit runner sources price data and routes order events.
+
+<Note>
+  Strategy code, runners, and the `@backtest-kit/cli` entrypoint remain completely unchanged when using this project. Only the persistence layer is swapped — the 15 `IPersist*` adapters replace the default file-based `./dump/` store transparently, with no modifications required to trading logic or CLI invocations.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Spin up MongoDB and Redis with docker-compose and run your first backtest in under five minutes.
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture">
+    Deep dive into atomicity guarantees, the Redis O(1) cache pattern, look-ahead bias protection, and the full Docker layout.
+  </Card>
+</CardGroup>

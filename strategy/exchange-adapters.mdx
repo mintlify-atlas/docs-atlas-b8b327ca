@@ -1,0 +1,222 @@
+---
+title: "Exchange Adapters: Connecting backtest-kit to CCXT and Binance"
+sidebarTitle: "Exchange Adapters"
+description: "How addExchangeSchema wires backtest-kit to CCXT for OHLCV candle fetching, order book queries, and price/quantity formatting on Binance spot markets."
+---
+
+Exchange adapters bridge backtest-kit with real market data sources. The `addExchangeSchema` function registers an implementation for a named exchange that provides OHLCV candle data, order book snapshots, and price/quantity formatting. All three running modes — backtest, paper, and live — use the same adapter interface; the strategy code never references the exchange directly.
+
+## Exchange name enum
+
+```typescript src/enum/ExchangeName.ts
+export enum ExchangeName {
+  CCXT = "ccxt-exchange",
+}
+```
+
+The string value `"ccxt-exchange"` is the identifier used in `addExchangeSchema` and when launching runs via `Backtest.background`, `Paper.background`, or `Live.background`.
+
+## Exchange singleton
+
+All exchange methods share a single `ccxt.binance` instance created via `singleshot` (lazy, memoized):
+
+```typescript modules/backtest.module.ts
+import { singleshot } from "functools-kit";
+import ccxt from "ccxt";
+
+const getExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    options: {
+      defaultType: "spot",
+      adjustForTimeDifference: true,
+      recvWindow: 60000,
+    },
+    enableRateLimit: true,
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+```
+
+| Option | Value | Effect |
+|---|---|---|
+| `defaultType` | `"spot"` | Targets the Binance spot market |
+| `adjustForTimeDifference` | `true` | Auto-corrects clock skew between local and Binance servers |
+| `recvWindow` | `60000` | 60-second receive window for request validity |
+| `enableRateLimit` | `true` | Respects Binance API rate limits automatically |
+
+## `addExchangeSchema` registration
+
+The schema is registered once per module file. The backtest, paper, and live modules share the same implementation:
+
+```typescript modules/backtest.module.ts
+import { addExchangeSchema, roundTicks, setConfig } from "backtest-kit";
+
+setConfig({
+  CC_MAX_STOPLOSS_DISTANCE_PERCENT: 100,
+});
+
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => { /* ... */ },
+  getOrderBook: async (symbol, depth, _from, _to, backtest) => { /* ... */ },
+  formatPrice: async (symbol, price) => { /* ... */ },
+  formatQuantity: async (symbol, quantity) => { /* ... */ },
+});
+```
+
+<Note>
+  `setConfig({ CC_MAX_STOPLOSS_DISTANCE_PERCENT: 100 })` disables the default maximum stop-loss distance check that backtest-kit would otherwise enforce. Remove or adjust this if you want distance-based stop-loss constraints.
+</Note>
+
+## Method reference
+
+### `getCandles`
+
+Fetches OHLCV candles from Binance via ccxt's `fetchOHLCV`.
+
+```typescript
+getCandles: async (symbol, interval, since, limit) => {
+  const exchange = await getExchange();
+  const candles = await exchange.fetchOHLCV(
+    symbol,
+    interval,
+    since.getTime(),
+    limit,
+  );
+  return candles.map(([timestamp, open, high, low, close, volume]) => ({
+    timestamp,
+    open,
+    high,
+    low,
+    close,
+    volume,
+  }));
+}
+```
+
+<ParamField path="symbol" type="string" required>
+  Market symbol, e.g. `"TRXUSDT"`.
+</ParamField>
+<ParamField path="interval" type="CandleInterval" required>
+  Candle interval string: `"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`, `"2h"`, `"4h"`, `"6h"`, `"8h"`, `"1d"`.
+</ParamField>
+<ParamField path="since" type="Date" required>
+  Start timestamp for the candle range.
+</ParamField>
+<ParamField path="limit" type="number" required>
+  Number of candles to fetch.
+</ParamField>
+
+Returns `{ timestamp, open, high, low, close, volume }[]`.
+
+---
+
+### `getOrderBook`
+
+Fetches the current order book from Binance. **Throws in backtest mode.**
+
+```typescript
+getOrderBook: async (symbol, depth, _from, _to, backtest) => {
+  if (backtest) {
+    throw new Error(
+      "Order book fetching is not supported in backtest mode for the default exchange schema. Please implement it according to your needs.",
+    );
+  }
+  const exchange = await getExchange();
+  const bookData = await exchange.fetchOrderBook(symbol, depth);
+  return {
+    symbol,
+    asks: bookData.asks.map(([price, quantity]) => ({
+      price: String(price),
+      quantity: String(quantity),
+    })),
+    bids: bookData.bids.map(([price, quantity]) => ({
+      price: String(price),
+      quantity: String(quantity),
+    })),
+  };
+}
+```
+
+<Warning>
+  `getOrderBook` throws an error when called in backtest mode. If your strategy requires order book data during backtesting, implement a custom simulation (e.g., reconstruct the book from historical trade data) before calling `addExchangeSchema`.
+</Warning>
+
+Returns `{ symbol, asks: [{price, quantity}][], bids: [{price, quantity}][] }`.
+
+---
+
+### `formatPrice`
+
+Rounds a price to the market's tick size.
+
+```typescript
+formatPrice: async (symbol, price) => {
+  const exchange = await getExchange();
+  const market = exchange.market(symbol);
+  const tickSize = market.limits?.price?.min || market.precision?.price;
+  if (tickSize !== undefined) {
+    return roundTicks(price, tickSize);
+  }
+  return exchange.priceToPrecision(symbol, price);
+}
+```
+
+Uses `roundTicks` (from `backtest-kit`) when a numeric tick size is available, falling back to ccxt's `priceToPrecision` otherwise. Returns a `string`.
+
+---
+
+### `formatQuantity`
+
+Rounds a quantity to the market's lot size step.
+
+```typescript
+formatQuantity: async (symbol, quantity) => {
+  const exchange = await getExchange();
+  const market = exchange.market(symbol);
+  const stepSize = market.limits?.amount?.min || market.precision?.amount;
+  if (stepSize !== undefined) {
+    return roundTicks(quantity, stepSize);
+  }
+  return exchange.amountToPrecision(symbol, quantity);
+}
+```
+
+Uses `roundTicks` when a numeric step size is available, falling back to ccxt's `amountToPrecision`. Returns a `string`.
+
+## Module files
+
+The `modules/` directory contains three separate files that each call `addExchangeSchema`:
+
+| File | Used by mode |
+|---|---|
+| `modules/backtest.module.ts` | Backtest entry point (`src/main/backtest.ts`) |
+| `modules/live.module.ts` | Live entry point (`src/main/live.ts`) |
+| `modules/paper.module.ts` | Paper entry point (`src/main/paper.ts`) |
+
+<Note>
+  All three module files currently share identical `addExchangeSchema` implementations. Separate files exist so you can customize exchange behavior per mode — for example, adding API keys only in the live module.
+</Note>
+
+## Registering a custom exchange
+
+To connect to a different exchange or data source, replace the `addExchangeSchema` call in the appropriate module file:
+
+```typescript modules/backtest.module.ts
+addExchangeSchema({
+  exchangeName: "my-exchange",
+  getCandles: async (symbol, interval, since, limit) => {
+    // Fetch from your data source
+    return myDataSource.fetchOHLCV(symbol, interval, since, limit);
+  },
+  getOrderBook: async (symbol, depth, _from, _to, backtest) => {
+    // Return simulated or real order book
+    return { symbol, asks: [], bids: [] };
+  },
+  formatPrice: async (symbol, price) => String(price),
+  formatQuantity: async (symbol, quantity) => String(quantity),
+});
+```
+
+Update the `ExchangeName` enum and all references in `src/main/*.ts` to match the new `exchangeName` string.

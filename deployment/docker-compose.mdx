@@ -1,0 +1,156 @@
+---
+title: "Docker Compose Setup: MongoDB, Redis, and backtest-kit Container"
+sidebarTitle: "Docker Compose"
+description: "Configure and launch the full backtest-kit Redis+MongoDB stack using docker-compose, with separate infrastructure containers and a backtest-kit application container."
+---
+
+The backtest-kit Redis+MongoDB Docker project is composed of **three containers** spread across three separate Compose files. Two infrastructure containers — MongoDB and Redis — are defined under `docker/` and are started independently of the application. The third container runs the `tripolskypetr/backtest-kit` image, mounts your project directory as `/workspace`, and is wired to reach the infrastructure containers via Docker's `host.docker.internal` gateway. This separation lets you keep your data services running continuously while iterating on strategy code and restarting only the application container.
+
+## Directory layout
+
+```
+docker/
+  mongodb/docker-compose.yaml   # mongodb:8.0.4 on :27017, volume ./mongo_data
+  redis/docker-compose.yaml     # redis:7.4.1 on :6379, password=mysecurepassword
+docker-compose.yaml             # backtest-kit container, mounts project as /workspace
+```
+
+## Infrastructure containers
+
+MongoDB and Redis each live in their own Compose file under `docker/`. Starting them independently means your persisted data survives application restarts and redeploys without any extra steps.
+
+<CodeGroup>
+
+```yaml MongoDB
+# docker/mongodb/docker-compose.yaml
+version: '3.8'
+services:
+  mongodb:
+    image: mongodb/mongodb-community-server:8.0.4-ubi8
+    container_name: mongodb
+    ports:
+      - '27017:27017'
+    volumes:
+      - ./mongo_data:/data/db
+    restart: always
+volumes:
+  mongo_data:
+```
+
+```yaml Redis
+# docker/redis/docker-compose.yaml
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7.4.1
+    container_name: redis
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_PASSWORD=mysecurepassword
+    command: ["redis-server", "--requirepass", "mysecurepassword"]
+    volumes:
+      - ./redis_data:/data
+    restart: always
+
+volumes:
+  redis_data:
+```
+
+</CodeGroup>
+
+**MongoDB** uses the official `mongodb/mongodb-community-server:8.0.4-ubi8` image and exposes port `27017`. Strategy data is persisted to the `./mongo_data` volume so all 15 adapter collections survive container restarts. `restart: always` ensures MongoDB comes back up automatically after a host reboot.
+
+**Redis** uses `redis:7.4.1` and exposes port `6379`. The password `mysecurepassword` is passed directly to `redis-server` via `--requirepass`, providing authentication for all incoming connections. Data is stored in `./redis_data`, and like MongoDB the container is set to `restart: always`.
+
+## Application container
+
+The root `docker-compose.yaml` defines the `backtest-kit` application container. It builds no image — it pulls `tripolskypetr/backtest-kit` directly and mounts your local project directory into `/workspace` so the container always runs whatever strategy code and compiled bundle is present on disk.
+
+```yaml
+# docker-compose.yaml
+version: '3.8'
+
+services:
+  backtest:
+    image: tripolskypetr/backtest-kit
+    platform: linux/amd64
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    container_name: backtest-kit-redis-mongo-docker
+    ports:
+      - "60050:60050"
+    restart: unless-stopped
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    environment:
+      - MODE
+      - STRATEGY_FILE
+      - SYMBOL
+      - STRATEGY
+      - EXCHANGE
+      - FRAME
+      - UI
+      - TELEGRAM
+      - VERBOSE
+      - NO_CACHE
+      - NO_FLUSH
+      - ENTRY
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:60050/api/v1/health/health_check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+Key properties of the application container:
+
+- **`platform: linux/amd64`** — pins the image architecture, ensuring consistent behaviour on Apple Silicon and other ARM hosts running Docker with emulation.
+- **`extra_hosts: host.docker.internal:host-gateway`** — injects a host entry that resolves `host.docker.internal` to the Docker host's IP, allowing the container to reach MongoDB on `27017` and Redis on `6379` without exposing those ports to the wider network.
+- **Port `60050:60050`** — maps the web UI port from container to host. The UI is enabled with `UI=1`.
+- **Volume `./:/workspace`** — mounts the entire project directory (including `.env`, `build/`, source files) into `/workspace`. `working_dir` is set to `/workspace` so all relative paths in the CLI resolve correctly.
+- **`env_file: .env`** — loads your local `.env` file for infrastructure connection strings. Individual environment variables (`MODE`, `ENTRY`, `UI`, etc.) are passed through from the host shell.
+- **Healthcheck** — polls `http://localhost:60050/api/v1/health/health_check` every 30 seconds with a 10-second timeout and 3 retries. Docker marks the container unhealthy if the endpoint is unreachable after all retries.
+
+## Quick commands
+
+```bash
+# Start infrastructure only
+docker-compose -f docker/mongodb/docker-compose.yaml up -d
+docker-compose -f docker/redis/docker-compose.yaml up -d
+
+# Full stack
+npm run start:docker   # or: MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+npm run stop:docker
+
+# Logs
+docker-compose logs -f
+```
+
+`npm run start:docker` is a convenience script defined in `package.json` that compiles your TypeScript strategy with Rollup before launching the container, ensuring `/workspace/build/index.cjs` is always up-to-date. `npm run stop:docker` calls `docker-compose down` to stop and remove the application container while leaving the infrastructure containers running.
+
+<Note>
+When running the application container, use `host.docker.internal` instead of `127.0.0.1` in your MongoDB and Redis connection strings. From inside the container, `127.0.0.1` refers to the container's own loopback interface — not the host. The `.env.example` file already uses `host.docker.internal` as the default:
+
+```
+CC_REDIS_HOST=host.docker.internal
+CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-kit?wtimeoutMS=15000
+```
+</Note>
+
+<Tip>
+If your MongoDB or Redis instances run on a remote server rather than the local host, override the connection strings in your `.env` file before starting the application container:
+
+```
+CC_MONGO_CONNECTION_STRING=mongodb://remote-server:27017/backtest-pro?wtimeoutMS=15000
+CC_REDIS_HOST=remote-server
+CC_REDIS_PORT=6379
+CC_REDIS_PASSWORD=your-secure-password
+```
+
+The `extra_hosts` mapping is only needed when infrastructure runs on the same host as Docker. Remote addresses resolve normally without it.
+</Tip>

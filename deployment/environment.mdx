@@ -1,0 +1,117 @@
+---
+title: "Environment Variables Reference for backtest-kit Docker"
+sidebarTitle: "Environment"
+description: "Complete reference for all environment variables consumed by backtest-kit-redis-mongo-docker, including MongoDB, Redis connection settings and backtest-kit CLI flags."
+---
+
+The backtest-kit Redis+MongoDB Docker project reads environment variables from two distinct groups. The first group configures the **infrastructure connections** — where to find MongoDB and Redis — and is consumed by `src/config/params.ts` at startup. The second group controls the **backtest-kit runtime** — which mode to run, which strategy file to load, and which optional features to enable — and is forwarded to `@backtest-kit/cli` inside the container. Both groups can be set in a `.env` file at the project root, which is loaded automatically by Docker Compose via `env_file: .env`.
+
+## `.env.example`
+
+The repository ships with a minimal `.env.example` that configures both connections to target the Docker host (for use with the infrastructure containers started from `docker/`):
+
+```bash
+CC_REDIS_HOST=host.docker.internal
+CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-kit?wtimeoutMS=15000
+```
+
+Copy this file to `.env` and adjust the values for your environment before starting the stack.
+
+## Infrastructure variables
+
+These variables are read by `src/config/params.ts` and used to construct the Redis (`ioredis`) and MongoDB (`mongoose`) client connections. All have fallback defaults that point to `localhost`, which is suitable for running the Node process directly on the host outside of Docker.
+
+<ParamField body="CC_REDIS_HOST" type="string" default="127.0.0.1">
+  Hostname or IP address of the Redis server. When running the backtest-kit application container, set this to `host.docker.internal` so the container can reach Redis on the Docker host. For remote infrastructure, use the server's hostname or IP.
+</ParamField>
+
+<ParamField body="CC_REDIS_PORT" type="number" default="6379">
+  TCP port that the Redis server is listening on. The bundled `docker/redis/docker-compose.yaml` exposes Redis on the standard port `6379`.
+</ParamField>
+
+<ParamField body="CC_REDIS_USER" type="string" default="default">
+  Redis ACL username used for authentication. The default Redis ACL user is named `default`. Change this only if your Redis instance has a custom ACL configuration.
+</ParamField>
+
+<ParamField body="CC_REDIS_PASSWORD" type="string" default="mysecurepassword">
+  Password for Redis authentication, passed to the `ioredis` client as the `password` option. This must match the `--requirepass` value configured in `docker/redis/docker-compose.yaml`. Override this with a strong unique password for production deployments.
+</ParamField>
+
+<ParamField body="CC_MONGO_CONNECTION_STRING" type="string" default="mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000">
+  Full MongoDB connection URI passed directly to `mongoose.connect()`. Includes the database name and a `wtimeoutMS=15000` write concern timeout. When targeting the bundled MongoDB container from inside the application container, use `host.docker.internal` as the hostname. Change the database name (e.g. `backtest-kit`) to match your desired MongoDB database.
+</ParamField>
+
+## Container runtime variables
+
+These variables are consumed by `@backtest-kit/cli` when the application container starts. They mirror the CLI flags accepted by the local `npm run start` command and are forwarded from the host environment (or `.env` file) into the container via the `environment` block in `docker-compose.yaml`.
+
+<ParamField body="MODE" type="string">
+  Selects the execution mode. Accepted values: `backtest`, `paper`, `live`. Maps to the `--backtest`, `--paper`, and `--live` CLI flags respectively. Must be combined with `ENTRY=1` to actually start execution.
+</ParamField>
+
+<ParamField body="STRATEGY_FILE" type="string" default="./build/index.cjs">
+  Path to the compiled strategy bundle inside the container. Because the project directory is mounted as `/workspace`, a relative path like `./build/index.cjs` resolves to `/workspace/build/index.cjs`. Run `npm run build` (or let `npm run start:docker` do it) before starting the container so this file exists.
+</ParamField>
+
+<ParamField body="ENTRY" type="string">
+  Set to `1` to allow the mode entry points to proceed. This mirrors the `--entry` CLI flag. Without `ENTRY=1`, the process starts but immediately exits from every mode's guard check (`if (!values.entry) return`), making it a safe default for containers that should not auto-run on start.
+</ParamField>
+
+<ParamField body="SYMBOL" type="string">
+  Override the trading symbol defined in the strategy (e.g. `TRXUSDT`, `BTCUSDT`). When set, the CLI passes this value to the strategy context instead of the hardcoded default.
+</ParamField>
+
+<ParamField body="STRATEGY" type="string">
+  Override the strategy name registered in the strategy bundle. Useful when a single compiled bundle contains multiple strategies and you want to select one at runtime.
+</ParamField>
+
+<ParamField body="EXCHANGE" type="string">
+  Override the exchange name used by the strategy (e.g. `ccxt`). Corresponds to the `exchangeName` field in the strategy context.
+</ParamField>
+
+<ParamField body="FRAME" type="string">
+  Override the frame name used by the strategy. Corresponds to the `frameName` field, which controls the OHLCV candle interval and time-range definition.
+</ParamField>
+
+<ParamField body="UI" type="string">
+  Set to `1` to enable the web UI on port `60050`. The UI provides a real-time dashboard for monitoring signals, positions, and strategy metrics. The container healthcheck targets this port, so `UI=1` is required for the healthcheck to pass.
+</ParamField>
+
+<ParamField body="TELEGRAM" type="string">
+  Set to `1` to enable Telegram notifications for trade signals and alerts. Requires Telegram bot credentials to be configured in your strategy or environment.
+</ParamField>
+
+<ParamField body="VERBOSE" type="string">
+  Set to `1` to enable verbose logging. Outputs detailed internal state transitions and adapter read/write operations to stdout.
+</ParamField>
+
+<ParamField body="NO_CACHE" type="string">
+  Set to `1` to disable the Redis cache layer. All adapter reads will fall through directly to MongoDB. Useful for debugging cache consistency issues but significantly increases MongoDB query load during backtests.
+</ParamField>
+
+<ParamField body="NO_FLUSH" type="string">
+  Set to `1` to disable the data flush on process exit. By default, backtest-kit flushes in-memory state to the persistence layer when the process receives `SIGINT`. Disabling this speeds up container shutdowns at the cost of potentially losing the last few writes.
+</ParamField>
+
+## Production `.env` example
+
+A complete `.env` file for a production deployment with remote infrastructure:
+
+```bash
+# Infrastructure connections
+CC_REDIS_HOST=prod-redis
+CC_REDIS_PORT=6379
+CC_REDIS_USER=default
+CC_REDIS_PASSWORD=your-secure-password
+CC_MONGO_CONNECTION_STRING=mongodb://prod-mongo:27017/backtest-pro?wtimeoutMS=15000
+```
+
+Runtime variables for the container are typically passed as shell environment variables or via CI/CD secrets rather than stored in `.env`:
+
+```bash
+MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+```
+
+<Warning>
+Never commit your `.env` file to version control. It contains Redis passwords and MongoDB connection strings that may include credentials. The repository's `.gitignore` already excludes `.env` — verify this is in place before your first commit, especially if you fork or copy this project.
+</Warning>
