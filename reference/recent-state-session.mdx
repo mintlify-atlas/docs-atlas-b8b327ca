@@ -1,7 +1,7 @@
 ---
-title: "Recent, State, and Session Persist Adapters"
-sidebarTitle: "Recent / State / Session"
-description: "Reference for PersistRecentAdapter, PersistStateAdapter, and PersistSessionAdapter — adapters for tracking signal history, per-signal state buckets, and strategy sessions."
+title: "Recent, State and Session MongoDB Persist Adapters"
+sidebarTitle: "Recent, State, Session"
+description: "Reference for PersistRecentAdapter, PersistStateAdapter, and PersistSessionAdapter: tracking last signal, per-signal state buckets, and strategy sessions."
 ---
 
 Recent, State, and Session are the three **ongoing strategy state adapters**. They track what a strategy is currently doing — the most recently published signal for a context, arbitrary per-signal state keyed by bucket name, and the lifecycle data for a running strategy session. All three carry a `when: Date` column for look-ahead bias protection, and both State and Session expose a `dispose()` method that backtest-kit calls when the associated signal or session ends.

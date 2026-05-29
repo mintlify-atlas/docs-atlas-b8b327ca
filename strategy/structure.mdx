@@ -75,8 +75,11 @@ Each line is a JSON-encoded `SignalEntryModel` with the following shape:
 |---|---|---|
 | `symbol` | `string` | Trading pair, e.g. `"TRXUSDT"` |
 | `publishedAt` | `string` | ISO-8601 timestamp for when the signal fires |
+| `direction` | `"long" \| "short"` | Suggested trade direction from the signal source |
 | `entry.from` | `number` | Lower bound of the valid entry price range |
 | `entry.to` | `number` | Upper bound of the valid entry price range |
+| `targets` | `number[]` | Array of target price levels for the trade |
+| `stoploss` | `number` | Suggested stop-loss price level |
 | `note` | `string` | Human-readable annotation stored on the position |
 
 The helper `getActiveSignal(symbol, when)` aligns `publishedAt` to the nearest 1-minute boundary and checks whether it matches the current simulation timestamp.

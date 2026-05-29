@@ -14,6 +14,8 @@ All 15 cache services inherit from `BaseMap`, a thin `ioredis` wrapper defined i
 // src/lib/common/BaseMap.ts (abridged)
 export const BaseMap = factory(
   class BaseMap {
+    readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
     constructor(
       readonly connectionKey: string,
       readonly ttlExpireSeconds: number = DEFAULT_TTL_EXPIRE_SECONDS  // 5 * 60 by default
@@ -52,6 +54,7 @@ Each domain gets its own cache class that encodes the compound key scheme for th
 const REDIS_KEY = "signal_cache";
 
 export class SignalCacheService extends BaseMap(REDIS_KEY, -1) {
+  readonly loggerService = inject<LoggerService>(TYPES.loggerService);
 
   private _cacheKey(
     symbol: string,
@@ -83,9 +86,9 @@ export class SignalCacheService extends BaseMap(REDIS_KEY, -1) {
   public async setSignalId(row: ISignalRowDoc): Promise<string> {
     await super.set(
       this._cacheKey(row.symbol, row.strategyName, row.exchangeName),
-      row.id,  // stores the MongoDB _id string
+      row.id,
     );
-    return row.id;
+    return row.id;  // returns the stored MongoDB _id string
   }
 }
 ```

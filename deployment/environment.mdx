@@ -1,7 +1,7 @@
 ---
 title: "Environment Variables Reference for backtest-kit Docker"
 sidebarTitle: "Environment"
-description: "Complete reference for all environment variables consumed by backtest-kit-redis-mongo-docker, including MongoDB, Redis connection settings and backtest-kit CLI flags."
+description: "Complete reference for all environment variables in backtest-kit-redis-mongo-docker, covering MongoDB and Redis connection settings and runtime CLI flags."
 ---
 
 The backtest-kit Redis+MongoDB Docker project reads environment variables from two distinct groups. The first group configures the **infrastructure connections** — where to find MongoDB and Redis — and is consumed by `src/config/params.ts` at startup. The second group controls the **backtest-kit runtime** — which mode to run, which strategy file to load, and which optional features to enable — and is forwarded to `@backtest-kit/cli` inside the container. Both groups can be set in a `.env` file at the project root, which is loaded automatically by Docker Compose via `env_file: .env`.

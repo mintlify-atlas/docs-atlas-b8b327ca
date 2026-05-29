@@ -1,7 +1,7 @@
 ---
 title: "BaseMap: Redis Key-Value Store Factory for Cache Services"
 sidebarTitle: "BaseMap"
-description: "API reference for the BaseMap factory class that provides get, set, delete, has, keys, values, toArray, iterate, size, and clear operations over namespaced Redis keys."
+description: "API reference for BaseMap factory: get, set, delete, has, clear, toArray, iterate, keys, values, and size over namespaced Redis keys with optional TTL."
 ---
 
 `BaseMap` is the `di-factory` factory that all 15 `CacheService` classes extend. It wraps the shared ioredis client with a string-keyed map API, adds namespace isolation so each service's keys cannot collide with another service's, and supports an optional TTL that is applied automatically on every `set` call. Bulk operations (`toArray`, `iterate`, `keys`, `values`, `size`, `clear`) use Redis `SCAN` with a batch size of 100 to avoid blocking the Redis event loop on large keyspaces.

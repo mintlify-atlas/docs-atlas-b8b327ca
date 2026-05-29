@@ -1,5 +1,5 @@
 ---
-title: "MongoService: Mongoose Connection Management"
+title: "MongoService: Mongoose Connection Setup and Lifecycle"
 sidebarTitle: "MongoService"
 description: "Reference for the MongoService class that manages the Mongoose connection lifecycle, including waitForInit() and connection string configuration."
 ---
@@ -107,9 +107,9 @@ You never `new MongooseService()` directly; access it through `ioc.mongoService`
 
 ## Methods
 
-### `waitForInit(): Promise<void>`
+### `waitForInit(): Promise<Mongoose>`
 
-Establishes the Mongoose connection to MongoDB. Safe to call multiple times — subsequent calls resolve immediately against the already-settled promise thanks to the `singleshot` wrapper.
+Establishes the Mongoose connection to MongoDB and resolves to the connected `Mongoose` instance. Safe to call multiple times — subsequent calls resolve immediately against the already-settled promise thanks to the `singleshot` wrapper.
 
 The method races the connection event against a **15-second timeout**. If the timeout fires before the `connected` event, `waitForInit.clear()` resets the singleshot gate so the next call will attempt a fresh connection, and the method throws `Error("Mongoose connection timeout")`.
 

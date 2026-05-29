@@ -1,7 +1,7 @@
 ---
 title: "Measure, Interval, and Memory Persist Adapters (Soft-Delete)"
-sidebarTitle: "Measure / Interval / Memory"
-description: "Reference for the three soft-delete persist adapters: Measure for LLM response caching, Interval for once-per-interval markers, and Memory for per-signal key-value storage."
+sidebarTitle: "Measure, Interval, Memory"
+description: "Reference for three soft-delete adapters: Measure caches LLM responses, Interval tracks once-per-candle guards, Memory stores per-signal key-value pairs."
 ---
 
 Measure, Interval, and Memory are the three **soft-delete adapters**. Instead of physically removing documents, all three set `removed: true` on the record (and `payload.removed: true` inside the payload itself) to mark it as deleted. Listing operations filter on `removed: false` to skip tombstones. This matches the behavior of the default file-based persist implementation bundled with backtest-kit and makes it safe to replay or audit the full history of creates and deletes.

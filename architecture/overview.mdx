@@ -44,7 +44,7 @@ All services are wired together in `src/lib/index.ts` via a lightweight IoC cont
 | **Cache services** | 15 | Per-domain Redis wrappers (one per domain) |
 | **DB services** | 15 | Per-domain MongoDB CRUD + upsert logic |
 
-The registration happens in `src/lib/core/provide.ts` using `provide(TOKEN, factory)` calls, and `src/lib/index.ts` exposes the resolved instances via the `ioc` object:
+The registration happens in `src/lib/core/provide.ts` using `provide(TYPES.xxx, () => new XService())` calls, and `src/lib/index.ts` exposes the resolved instances via the `ioc` object:
 
 ```typescript
 // src/lib/index.ts (abridged)
@@ -96,8 +96,11 @@ export const ioc = {
   ...dbServices,
 };
 
-// Also published to globalThis for convenience:
+init();
+
 Object.assign(globalThis, { ioc });
+
+export default ioc;
 ```
 
 All 15 adapter registrations in `src/config/setup.ts` use `ioc.xDbService` and `ioc.xCacheService` directly; no adapter needs to know whether it is talking to Mongo or Redis.
@@ -130,7 +133,7 @@ const waitForInfra = singleshot(async () => {
     How the indexed `when: Date` column lets backtest-kit's bias filter verify
     that reads never see future data.
   </Card>
-  <Card title="Deployment" icon="rocket" href="/deployment">
+  <Card title="Deployment" icon="rocket" href="/deployment/docker-compose">
     Docker Compose setup for running MongoDB, Redis, and the adapter layer
     together in a single-command environment.
   </Card>

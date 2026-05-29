@@ -1,5 +1,5 @@
 ---
-title: "RedisService: ioredis Connection Management"
+title: "RedisService: ioredis Connection Setup and Lifecycle"
 sidebarTitle: "RedisService"
 description: "Reference for the RedisService class that manages the ioredis connection to Redis, including authentication, waitForInit(), and the getRedis() singleton."
 ---
@@ -105,9 +105,9 @@ Access the service through `ioc.redisService`; never construct it directly.
 
 ## Methods
 
-### `waitForInit(): Promise<void>`
+### `waitForInit(): Promise<Redis>`
 
-Establishes the ioredis connection to Redis. Safe to call multiple times — the `singleshot` wrapper ensures the handshake occurs exactly once and all concurrent callers await the same promise.
+Establishes the ioredis connection to Redis and resolves to the connected `Redis` instance. Safe to call multiple times — the `singleshot` wrapper ensures the handshake occurs exactly once and all concurrent callers await the same promise.
 
 The method checks `redis.status === 'ready'` immediately; if Redis is already connected it returns right away. Otherwise it races the `ready` event against a **15-second timeout**. On timeout it clears the singleshot gate (so a future call can retry) and throws `Error("Redis connection timeout")`.
 

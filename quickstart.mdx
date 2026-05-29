@@ -60,7 +60,7 @@ This guide walks you through cloning the repository, configuring your environmen
 
     This brings up:
 
-    - **MongoDB 8.0.4** on port `27017` — data persisted to `docker/mongodb/mongo_data/`
+    - **MongoDB Community Server 8.0.4** (`mongodb/mongodb-community-server:8.0.4-ubi8`) on port `27017` — data persisted to `docker/mongodb/mongo_data/`
     - **Redis 7.4.1** on port `6379` — password `mysecurepassword`, data persisted to `docker/redis/redis_data/`
 
     Both services are configured with `restart: always`, so they survive host reboots automatically. Verify they are running with `docker ps` before proceeding.
@@ -73,14 +73,14 @@ This guide walks you through cloning the repository, configuring your environmen
     npm run start -- --entry --backtest --ui ./build/index.cjs
     ```
 
-    Flag reference:
+    Flag and argument reference:
 
-    | Flag | Effect |
+    | Flag / Argument | Effect |
     |---|---|
     | `--entry` | Activates the runner. Without this flag the process exits immediately (safety guard). |
     | `--backtest` | Selects backtest mode — historical candle data is used. |
     | `--ui` | Enables the web interface on port `60050`. |
-    | `./build/index.cjs` | Path to the compiled strategy bundle produced by `npm run build`. |
+    | `./build/index.cjs` | Positional argument: path to the compiled strategy bundle (produced by the `npm run build` step embedded in `npm run start`). |
 
     To run in paper or live mode instead, replace `--backtest` with `--paper` or `--live`:
 
@@ -132,5 +132,5 @@ The `MODE` variable accepts `backtest`, `paper`, or `live`. `ENTRY=1` and `UI=1`
 </Tip>
 
 <Note>
-  This quickstart uses default credentials and a single-node setup suitable for local development. See the [Architecture Overview](/architecture) page for a deep dive into atomicity guarantees and the Redis O(1) cache pattern, and the [Deployment](/deployment) page for production configuration including custom credentials, replica sets, and Redis Sentinel.
+  This quickstart uses default credentials and a single-node setup suitable for local development. See the [Architecture Overview](/architecture/overview) page for a deep dive into atomicity guarantees and the Redis O(1) cache pattern, and the [Deployment](/deployment/docker-compose) page for production configuration including custom credentials, replica sets, and Redis Sentinel.
 </Note>

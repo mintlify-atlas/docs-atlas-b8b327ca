@@ -1,7 +1,7 @@
 ---
-title: "Risk, Partial, and Breakeven Persist Adapters"
-sidebarTitle: "Risk / Partial / Breakeven"
-description: "Reference for PersistRiskAdapter, PersistPartialAdapter, and PersistBreakevenAdapter — signal-affecting adapters that store position data with look-ahead bias protection."
+title: "Risk, Partial and Breakeven MongoDB Persist Adapters"
+sidebarTitle: "Risk, Partial, Breakeven"
+description: "Reference for PersistRiskAdapter, PersistPartialAdapter, and PersistBreakevenAdapter: signal-affecting adapters with look-ahead bias protection."
 ---
 
 Risk, Partial, and Breakeven are the three **signal-affecting adapters**. They store data that directly influences open position management — live risk positions, partial profit/loss price levels, and the breakeven-reached flag. Because this data can change the outcome of a backtest, all three carry a `when: Date` argument on their write methods and a `when: number` field in MongoDB. The engine uses `when` to prevent look-ahead bias: when replaying history, writes that would have happened "in the future" relative to the current simulation timestamp are withheld.

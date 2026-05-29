@@ -1,7 +1,7 @@
 ---
-title: "Storage, Notification, and Log Persist Adapters"
-sidebarTitle: "Storage / Notification / Log"
-description: "Reference for PersistStorageAdapter, PersistNotificationAdapter, and PersistLogAdapter that maintain signal history, event notifications, and strategy log entries."
+title: "Storage, Notification and Log MongoDB Persist Adapters"
+sidebarTitle: "Storage, Notification, Log"
+description: "Reference for PersistStorageAdapter, PersistNotificationAdapter, and PersistLogAdapter: audit trail adapters for signals, events, and log entries."
 ---
 
 Storage, Notification, and Log are the three **audit trail adapters**. Rather than influencing ongoing position management, they record what has already happened — closed and opened signals, fired notifications, and timestamped log lines. These adapters are append-oriented: writes upsert by a unique ID so that re-sending an already-persisted record is idempotent.

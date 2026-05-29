@@ -1,7 +1,7 @@
 ---
-title: "Configuration Reference: Environment Variables and Connection Settings"
+title: "Configuration: Environment Variables and Docker Setup"
 sidebarTitle: "Configuration"
-description: "Complete reference for all environment variables and configuration parameters in backtest-kit-redis-mongo-docker, including Redis, MongoDB, and backtest-kit runtime settings."
+description: "Complete reference for all environment variables, npm scripts, and Docker Compose configuration in backtest-kit-redis-mongo-docker."
 ---
 
 All runtime behaviour in `backtest-kit-redis-mongo-docker` is controlled through environment variables. Infrastructure connection settings (Redis host, MongoDB URI, etc.) are read once at startup from `src/config/params.ts` and defaulted to localhost values suitable for local development. Container runtime variables control the backtest-kit CLI mode, strategy selection, and optional integrations. A `.env` file at the project root is used by both the CLI toolchain and Docker Compose.
@@ -128,6 +128,19 @@ services:
     volumes:
       - ./:/workspace
     working_dir: /workspace
+    environment:
+      - MODE
+      - STRATEGY_FILE
+      - SYMBOL
+      - STRATEGY
+      - EXCHANGE
+      - FRAME
+      - UI
+      - TELEGRAM
+      - VERBOSE
+      - NO_CACHE
+      - NO_FLUSH
+      - ENTRY
     env_file:
       - .env
     healthcheck:

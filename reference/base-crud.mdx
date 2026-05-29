@@ -1,7 +1,7 @@
 ---
 title: "BaseCRUD: Generic MongoDB CRUD Factory for Mongoose Models"
 sidebarTitle: "BaseCRUD"
-description: "API reference for the BaseCRUD factory class providing create, findById, findByFilter, findAll, iterate, and paginate operations over any Mongoose model."
+description: "BaseCRUD factory reference: all 7 methods — create, update, findById, findByFilter, findAll, iterate, and paginate — over any Mongoose model."
 ---
 
 `BaseCRUD` is a `di-factory` factory class that provides a complete set of generic MongoDB operations for any Mongoose model. All 15 `DbService` classes in the project extend `BaseCRUD`, inheriting its full CRUD surface and supplementing it with domain-specific methods such as `upsert`, `findByContext`, and `listKeys`. By centralising common database logic in a single factory, every service gets consistent logging, error handling, and the `readTransform` normalisation step without duplicating code.

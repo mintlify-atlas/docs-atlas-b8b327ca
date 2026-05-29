@@ -1,7 +1,7 @@
 ---
 title: "MongoDB Schema Reference: All 15 Collection Definitions"
 sidebarTitle: "Schemas"
-description: "Mongoose schema definitions for all 15 MongoDB collections used by backtest-kit-redis-mongo-docker, including field types, indexes, and compound unique constraints."
+description: "Mongoose schema definitions for all 15 MongoDB collections in backtest-kit-redis-mongo-docker, including field types, indexes, and soft-delete schemas."
 ---
 
 All MongoDB persistence in `backtest-kit-redis-mongo-docker` is organised into 15 Mongoose schemas, one per domain concept. Each schema is defined in `src/schema/` and registered as a Mongoose model that a corresponding `DbService` wraps. Every schema uses `{ timestamps: { createdAt: "createDate", updatedAt: "updatedDate" } }` to get automatic timestamp management, and each defines a compound unique index that prevents duplicate entries for the same logical context. Schemas that track time-series or state snapshots include a `when` field (a Unix timestamp in milliseconds) to record the business-time of the last write.

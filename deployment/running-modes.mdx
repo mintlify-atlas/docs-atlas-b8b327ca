@@ -93,7 +93,7 @@ The four recognised flags are:
         to: new Date("2026-01-31T23:59:59Z"),
         interval: "1m",
         symbol: "TRXUSDT",
-      });
+      })
 
       Backtest.background("TRXUSDT", {
         exchangeName: ExchangeName.CCXT,
@@ -116,7 +116,7 @@ The four recognised flags are:
     **CLI:**
 
     ```bash
-    npm run start -- --entry --backtest --ui ./build/index.cjs
+    npm run start -- --entry --backtest
     ```
 
     **Docker environment variables:**
@@ -172,7 +172,7 @@ The four recognised flags are:
     **CLI:**
 
     ```bash
-    npm run start -- --entry --paper --ui ./build/index.cjs
+    npm run start -- --entry --paper
     ```
 
     **Docker environment variables:**
@@ -227,7 +227,7 @@ The four recognised flags are:
     **CLI:**
 
     ```bash
-    npm run start -- --entry --live ./build/index.cjs
+    npm run start -- --entry --live
     ```
 
     **Docker environment variables:**
@@ -254,7 +254,7 @@ await warmCandles({
   to: new Date("2026-01-31T23:59:59Z"),
   interval: "1m",
   symbol: "TRXUSDT",
-});
+})
 ```
 
 **Parameters:**
@@ -270,5 +270,5 @@ await warmCandles({
 Once `warmCandles` completes, every subsequent candle read during the simulation is served from the local MongoDB `candle-items` collection via the `CandleDbService` / `CandleCacheService` stack (O(1) Redis lookup → O(1) Mongo by `_id`). This eliminates redundant exchange API calls during the backtest replay loop and significantly reduces simulation time for large date ranges.
 
 <Note>
-  The web UI is available on port **60050** in all three modes. Pass the `--ui` flag when running locally, or set `UI=1` when running inside Docker. The UI provides a real-time dashboard showing signals, open positions, equity curves, and strategy logs — useful for monitoring paper and live runs as well as inspecting backtest results after the simulation completes.
+  The web UI is available on port **60050** in all three modes. Set `UI=1` in your environment (or in `.env`) to enable it, whether running locally or inside Docker. The UI provides a real-time dashboard showing signals, open positions, equity curves, and strategy logs — useful for monitoring paper and live runs as well as inspecting backtest results after the simulation completes.
 </Note>

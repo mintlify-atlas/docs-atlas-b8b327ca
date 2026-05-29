@@ -1,7 +1,7 @@
 ---
-title: "Docker Compose Setup: MongoDB, Redis, and backtest-kit Container"
+title: "Docker Compose Setup for backtest-kit Redis+MongoDB"
 sidebarTitle: "Docker Compose"
-description: "Configure and launch the full backtest-kit Redis+MongoDB stack using docker-compose, with separate infrastructure containers and a backtest-kit application container."
+description: "Configure and launch the backtest-kit Redis+MongoDB stack using Docker Compose, with separate infrastructure containers and an application container."
 ---
 
 The backtest-kit Redis+MongoDB Docker project is composed of **three containers** spread across three separate Compose files. Two infrastructure containers — MongoDB and Redis — are defined under `docker/` and are started independently of the application. The third container runs the `tripolskypetr/backtest-kit` image, mounts your project directory as `/workspace`, and is wired to reach the infrastructure containers via Docker's `host.docker.internal` gateway. This separation lets you keep your data services running continuously while iterating on strategy code and restarting only the application container.
@@ -124,7 +124,7 @@ docker-compose -f docker/mongodb/docker-compose.yaml up -d
 docker-compose -f docker/redis/docker-compose.yaml up -d
 
 # Full stack
-npm run start:docker   # or: MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
+npm run start:docker   # or: cross-env MODE=backtest ENTRY=1 UI=1 STRATEGY_FILE=./build/index.cjs docker-compose up -d
 npm run stop:docker
 
 # Logs
